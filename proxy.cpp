@@ -154,8 +154,17 @@ void *ep_loop_write(void *arg) {
 				perror("usb_raw_ep_write()");
 				exit(EXIT_FAILURE);
 			}
-			printf("EP%x(%s_%s): wrote %d bytes to host\n", ep.bEndpointAddress,
-				transfer_type.c_str(), dir.c_str(), rv);
+			if (debug_level >= 3) {
+				printf("EP%x(%s_%s): wrote %d bytes to host: ", ep.bEndpointAddress,
+					transfer_type.c_str(), dir.c_str(), rv);
+				for (int i = 0; i < rv && i < io.inner.length; i++) {
+					printf("%02x ", (unsigned char)io.data[i]);
+				}
+				printf("\n");
+			} else {
+				printf("EP%x(%s_%s): wrote %d bytes to host\n", ep.bEndpointAddress,
+					transfer_type.c_str(), dir.c_str(), rv);
+			}
 		}
 		else {
 			int length = io.inner.length;
