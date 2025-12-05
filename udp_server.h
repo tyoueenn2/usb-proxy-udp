@@ -20,6 +20,9 @@ private:
     int sockfd;
     std::thread server_thread;
     std::atomic<bool> running;
+    
+    // Track current mouse button state
+    uint8_t current_button_state;
 
     void server_loop();
     void process_packet(const std::string& packet);

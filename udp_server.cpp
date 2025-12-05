@@ -12,7 +12,7 @@
 #include <algorithm>
 #include <iomanip>
 
-UdpServer::UdpServer(int port) : port(port), sockfd(-1), running(false) {}
+UdpServer::UdpServer(int port) : port(port), sockfd(-1), running(false), current_button_state(0x00) {}
 
 UdpServer::~UdpServer() {
     stop();
@@ -121,7 +121,7 @@ void UdpServer::handle_command(const std::string& command) {
             // Byte 8: 00 (padding)
             std::vector<uint8_t> data(9, 0);
             data[0] = 0x02;  // Magic number
-            data[1] = 0x00;  // No buttons pressed
+            data[1] = current_button_state;  // Use current button state
             data[2] = 0x00;  // Padding
             
             // X coordinate: 16-bit signed little-endian (bytes 3-4)
@@ -137,7 +137,7 @@ void UdpServer::handle_command(const std::string& command) {
             data[8] = 0x00;  // Padding
             
             if (debug_level >= 2) {
-                printf("[CMD] Mouse move: X=%d, Y=%d\n", x, y);
+                printf("[CMD] Mouse move: X=%d, Y=%d (button state: 0x%02x)\n", x, y, current_button_state);
             }
             
             inject_packet(mouse_ep, data);
@@ -172,6 +172,42 @@ void UdpServer::handle_command(const std::string& command) {
         up[7] = 0x00;  // No scroll
         up[8] = 0x00;  // Padding
         inject_packet(mouse_ep, up);
+    } else if (cmd == "+mousedown") {
+        // Press and hold mouse button
+        int button = 1; // Default to left button
+        ss >> button; // Optional: read button number
+        
+        current_button_state |= (1 << (button - 1)); // Set button bit
+        
+        std::vector<uint8_t> data(9, 0);
+        data[0] = 0x02;  // Magic number
+        data[1] = current_button_state;
+        data[2] = 0x00;  // Padding
+        // Bytes 3-8: no movement or scroll
+        
+        if (debug_level >= 2) {
+            printf("[CMD] Mouse button %d down (state: 0x%02x)\n", button, current_button_state);
+        }
+        
+        inject_packet(mouse_ep, data);
+    } else if (cmd == "+mouseup") {
+        // Release mouse button
+        int button = 1; // Default to left button
+        ss >> button; // Optional: read button number
+        
+        current_button_state &= ~(1 << (button - 1)); // Clear button bit
+        
+        std::vector<uint8_t> data(9, 0);
+        data[0] = 0x02;  // Magic number
+        data[1] = current_button_state;
+        data[2] = 0x00;  // Padding
+        // Bytes 3-8: no movement or scroll
+        
+        if (debug_level >= 2) {
+            printf("[CMD] Mouse button %d up (state: 0x%02x)\n", button, current_button_state);
+        }
+        
+        inject_packet(mouse_ep, data);
     } else {
         printf("Error: Unknown command: %s\n", cmd.c_str());
     }
