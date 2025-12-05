@@ -235,8 +235,7 @@ void UdpServer::inject_packet(int ep_addr, const std::vector<uint8_t>& data) {
 }
 
 int UdpServer::find_mouse_endpoint() {
-    // Heuristic: Find first Interrupt IN endpoint.
-    // Mouse is usually HID class (Interface Class 3), but here we just look for endpoints.
+    // Look for HID Mouse: bInterfaceClass=3 (HID), bInterfaceProtocol=2 (Mouse)
     
     struct raw_gadget_config *config = &host_device_desc.configs[host_device_desc.current_config];
     
@@ -244,8 +243,31 @@ int UdpServer::find_mouse_endpoint() {
         struct raw_gadget_interface *iface = &config->interfaces[i];
         struct raw_gadget_altsetting *alt = &iface->altsettings[iface->current_altsetting];
         
-        // Check interface class?
-        // if (alt->interface.bInterfaceClass == 3) { ... } 
+        // Check if this is a HID Mouse interface (Class 3, Protocol 2)
+        if (alt->interface.bInterfaceClass == 3 && alt->interface.bInterfaceProtocol == 2) {
+            // Found HID Mouse interface, return its interrupt IN endpoint
+            for (int j = 0; j < alt->interface.bNumEndpoints; j++) {
+                struct raw_gadget_endpoint *ep = &alt->endpoints[j];
+                if ((ep->endpoint.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_INT &&
+                    (ep->endpoint.bEndpointAddress & USB_DIR_IN)) {
+                    if (debug_level >= 2) {
+                        printf("[INIT] Found mouse endpoint: 0x%02x (max packet: %d bytes)\n", 
+                               ep->endpoint.bEndpointAddress, ep->endpoint.wMaxPacketSize);
+                    }
+                    return ep->endpoint.bEndpointAddress;
+                }
+            }
+        }
+    }
+    
+    if (debug_level >= 1) {
+        printf("[WARN] No HID Mouse interface found, falling back to first Interrupt IN\n");
+    }
+    
+    // Fallback: Find first Interrupt IN endpoint
+    for (int i = 0; i < config->config.bNumInterfaces; i++) {
+        struct raw_gadget_interface *iface = &config->interfaces[i];
+        struct raw_gadget_altsetting *alt = &iface->altsettings[iface->current_altsetting];
         
         for (int j = 0; j < alt->interface.bNumEndpoints; j++) {
             struct raw_gadget_endpoint *ep = &alt->endpoints[j];
