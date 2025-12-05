@@ -1,191 +1,314 @@
-# usb-proxy
+# USB-Proxy with UDP Injection (Raspberry Pi 4 + Logitech Mouse Fork)
 
-This software is a USB proxy based on [raw-gadget](https://github.com/xairy/raw-gadget) and libusb. It is recommended to run this repo on a computer that has an USB OTG port, such as `Raspberry Pi 4` or other [hardware](https://github.com/xairy/raw-gadget/tree/master/tests#results) that can work with `raw-gadget`, otherwise might need to use `dummy_hcd` kernel module to set up virtual USB Device and Host controller that connected to each other inside the kernel.
+> ⚠️ **Disclaimer**: This is a fork specifically optimized for **Raspberry Pi 4** with **Logitech mice**. The code has been "vibe coded" (iteratively developed through experimentation) due to the complexity of USB protocols and my limited competence in this area. Use at your own risk!
 
-```
-------------     -----------------------------------------------     -----------------------
-|          |     |                                             |     |                     |
-|          |     |-------------                     -----------|     |-------------        |
-|   USB    <----->     USB    |    Host COMPUTER    |   USB    <----->     USB    |  USB   |
-|  device  |     |  host port |  running usb-proxy  | OTG port |     |  host port |  Host  |
-|          |     |-------------   with raw-gadget   -----------|     |-------------        |
-|          |     |                                             |     |                     |
-------------     -----------------------------------------------     -----------------------
-```
+This software is a USB proxy based on [raw-gadget](https://github.com/xairy/raw-gadget) and libusb, with added UDP injection capabilities for remote mouse control. It allows you to:
+- Proxy USB mouse traffic between a device and host
+- Inject mouse movements and clicks via UDP commands
+- Preserve physical mouse button states during injection (e.g., drag while injecting movement)
+- Automatically detect and adapt to Logitech mouse packet formats
+
+## Hardware Setup
 
 ```
-------------     ------------------------------------
-|          |     |                                  |
-|          |     |-------------    Host COMPUTER    |
-|   USB    <----->     USB    |  running usb-proxy  |
-|  device  |     |  host port |   with raw-gadget   |
-|          |     |-------------    and dummy_hcd    |
-|          |     |                                  |
-------------     ------------------------------------
+┌──────────────┐     ┌────────────────────────────────────┐     ┌─────────────┐
+│              │     │                                    │     │             │
+│   Logitech   │ USB │      Raspberry Pi 4 (RPi4)        │ USB │   Target    │
+│   Mouse      ├─────┤  USB Host Port    USB OTG Port    ├─────┤   Computer  │
+│              │     │  (Any USB port)   (USB-C port)    │     │             │
+└──────────────┘     └────────────────────────────────────┘     └─────────────┘
 ```
 
----
+## Prerequisites for Raspberry Pi 4
 
-## Building on Raspberry Pi 4
+### 1. Enable USB OTG (dwc2) Module
 
-1.  **Install Dependencies**:
-    ```bash
-    sudo apt-get update
-    sudo apt-get install build-essential libusb-1.0-0-dev libjsoncpp-dev
-    ```
+The USB-C port on RPi4 can act as a USB device (OTG mode). Enable it:
 
-2.  **Compile**:
-    ```bash
-    make
-    ```
-
----
-
-## How to use
-
-### Step 1: Prerequisite
-
-Please clone the [raw-gadget](https://github.com/xairy/raw-gadget), and compile the kernel modules(if you need `dummy_hcd` as well, please compile it, otherwise only need to compile `raw-gadget`) in the repo, then load `raw-gadget` kernel module, you will be able to access `/dev/raw-gadget` afterward.
-
-Install the package
-```shell
-sudo apt install libusb-1.0-0-dev libjsoncpp-dev
+```bash
+echo "dtoverlay=dwc2" | sudo tee -a /boot/config.txt
+echo "dwc2" | sudo tee -a /etc/modules
+sudo reboot
 ```
 
-### Step 2: Check device and driver name
-
-Please check the name of `device` and `driver` on your hardware with the following command. If you are going to use `dummy_hcd`, then this step can be skipped, because `usb-proxy` will use `dummy_hcd` by default.
-
-```shell
-# For device name
-$ ls /sys/class/udc/
-fe980000.usb
+After reboot, verify the UDC (USB Device Controller) is available:
+```bash
+ls /sys/class/udc/
+# Should output: fe980000.usb
 ```
 
-```shell
-# For driver name
-$ cat /sys/class/udc/fe980000.usb/uevent
-USB_UDC_NAME=fe980000.usb
+### 2. Build and Load raw-gadget Kernel Module
+
+Clone and build raw-gadget:
+```bash
+git clone https://github.com/xairy/raw-gadget.git
+cd raw-gadget
+make
+sudo insmod raw_gadget.ko
 ```
 
-Note: If you are not able to see the above on your `Raspberry Pi 4`, probably you didn't enable the `dwc2` kernel module, please execute the following command and try again after reboot.
-
-```shell
-$ echo "dtoverlay=dwc2" | sudo tee -a /boot/config.txt
-$ echo "dwc2" | sudo tee -a /etc/modules
-$ sudo reboot
+Verify it's loaded:
+```bash
+ls /dev/raw-gadget
+# Should exist
 ```
 
-### Step 3: Check vendor_id and product_id of USB device
+### 3. Install Dependencies
 
-Please plug the USB device that you want to test into `Raspberry Pi 4`, then execute `lsusb` on terminal.
-
-```shell
-$ lsusb
-Bus 003 Device 001: ID 1d6b:0002 Linux Foundation 2.0 root hub
-Bus 002 Device 001: ID 1d6b:0003 Linux Foundation 3.0 root hub
-Bus 001 Device 003: ID 1b3f:2247 Generalplus Technology Inc. GENERAL WEBCAM
-Bus 001 Device 002: ID 2109:3431 VIA Labs, Inc. Hub
-Bus 001 Device 001: ID 1d6b:0002 Linux Foundation 2.0 root hub
+```bash
+sudo apt-get update
+sudo apt-get install build-essential libusb-1.0-0-dev libjsoncpp-dev
 ```
 
-As you can see, There is a `Bus 001 Device 003: ID 1b3f:2247 Generalplus Technology Inc. GENERAL WEBCAM`, and `1b3f:2247` is the `vendor_id` and `product_id` with a colon between them.
+## Building
 
-### Step 4: Run
-
-```
-Usage:
-    -h/--help: print this help message
-    -v/--verbose: increase verbosity
-    --device: use specific device
-    --driver: use specific driver
-    --vendor_id: use specific vendor_id(HEX) of USB device
-    --product_id: use specific product_id(HEX) of USB device
-    --enable_injection: enable the injection feature
-    --injection_file: specify the file that contains injection rules
-```
-- If `device` not specified, `usb-proxy` will use `dummy_udc.0` as default device.
-- If `driver` not specified, `usb-proxy` will use `dummy_udc` as default driver.
-- If both `vendor_id` and `product_id` not specified, `usb-proxy` will connect the first USB device it can find.
-
-For example:
-```shell
-$ ./usb-proxy --device=fe980000.usb --driver=fe980000.usb --vendor_id=1b3f --product_id=2247
+```bash
+cd usb-proxy-udp
+make
 ```
 
-Please replace `fe980000.usb` with the `device` that you have when running this software, and then replace the `driver` variable with the string after `USB_UDC_NAME=` in step 2. Please also modify the `vendor_id` and `product_id` variable that you have checked in step 3.
+## Usage
 
----
+### Step 1: Find Your Mouse Details
 
-## How to do MITM attack with this project
+Plug your Logitech mouse into **any regular USB port** on the RPi4 (not the USB-C OTG port):
 
-This feature is still very simple. Ideas or suggestions are very welcome.
-
-### Step 1: Create rules
-
-Please edit the `injection.json` for the injection rules. The following is the default template.
-
-Note: The comment in the following template is only for explaining the meaning, please do not copy the comment, it is invalid in json.
-
-```json
-{
-	"control": {
-        "modify": [ // For modify the control transfer data
-            {
-                "enable": false, // Enable this rule or not
-                "bRequestType": 0, // Hex value
-                "bRequest": 0, // Hex value
-                "wValue": 0, // Hex value
-                "wIndex": 0, // Hex value
-                "wLength": 0, // Hex value
-                "content_pattern": [], // If USB packet contains any data that match any patterns, the matched data will be replaced with the value in "replacement". Format is Hex string, for example: \\x01\\x00\\x00\\x00
-                "replacement": "" // The content after modified. Format is Hex string, for example: \\x02\\x00\\x00\\x00
-            }
-        ],
-        "ignore": [ // For ignoring control transfer packet, it won't be sent to Host/Device if match the rule
-            {
-                "enable": false,
-                "bRequestType": 0,
-                "bRequest": 0,
-                "wValue": 0,
-                "wIndex": 0,
-                "wLength": 0,
-                "content_pattern": []
-            }
-        ],
-        "stall": [ // For stalling Host if match the rule
-            {
-                "enable": false,
-                "bRequestType": 0,
-                "bRequest": 0,
-                "wValue": 0,
-                "wIndex": 0,
-                "wLength": 0,
-                "content_pattern": []
-            }
-        ]
-    },
-    "int": [
-        {
-            "ep_address": 81, // Endpoint address in Hex
-            "enable": false,
-            "content_pattern": [],
-            "replacement": ""
-        }
-    ],
-    "bulk": [
-        {
-            "ep_address": 81,
-            "enable": false,
-            "content_pattern": [],
-            "replacement": ""
-        }
-    ],
-	"isoc": [] // This transfer type is not supported yet
-}
+```bash
+lsusb
 ```
 
-For example, the following rules work with my USB mouse, and convert left click to right click, and convert right click to left click.
+Example output:
+```
+Bus 001 Device 004: ID 046d:c539 Logitech, Inc. USB Receiver
+```
+
+Here, `046d` is the vendor ID and `c539` is the product ID.
+
+### Step 2: Run the USB Proxy
+
+Basic command:
+```bash
+sudo ./usb-proxy --device=fe980000.usb --driver=fe980000.usb --vendor_id=046d --product_id=c539
+```
+
+With debugging and injection enabled:
+```bash
+sudo ./usb-proxy \
+    --device=fe980000.usb \
+    --driver=fe980000.usb \
+    --vendor_id=046d \
+    --product_id=c539 \
+    --debug_level=2 \
+    --enable_injection
+```
+
+### Command Line Arguments
+
+| Argument | Description | Example |
+|----------|-------------|---------|
+| `--device` | UDC device name (always `fe980000.usb` on RPi4) | `--device=fe980000.usb` |
+| `--driver` | UDC driver name (always `fe980000.usb` on RPi4) | `--driver=fe980000.usb` |
+| `--vendor_id` | USB vendor ID in hex | `--vendor_id=046d` |
+| `--product_id` | USB product ID in hex | `--product_id=c539` |
+| `--debug_level` | Debug verbosity: 0=off, 1=basic, 2=detailed, 3=full hex dumps | `--debug_level=2` |
+| `--enable_injection` | Enable UDP injection and file-based injection | `--enable_injection` |
+| `--injection_file` | JSON file with injection rules (default: `injection.json`) | `--injection_file=rules.json` |
+| `--descriptor_file` | File to save USB descriptors (default: `usb_descriptors.json`) | `--descriptor_file=desc.json` |
+| `-v/--verbose` | Increase general verbosity | `-v` |
+| `-h/--help` | Show help message | `-h` |
+
+## UDP Injection Commands
+
+The proxy includes a UDP server on port **12345** that accepts injection commands.
+
+### Mouse Movement: `+move X Y`
+
+Inject a relative mouse movement.
+
+**Format:** `+move X Y`
+- `X`: Horizontal movement (-32768 to 32767, negative = left, positive = right)
+- `Y`: Vertical movement (-32768 to 32767, negative = up, positive = down)
+
+**Examples:**
+```bash
+# Move right 10 pixels
+echo "+move 10 0" | nc -u -w1 localhost 12345
+
+# Move left 50, down 20
+echo "+move -50 20" | nc -u -w1 localhost 12345
+
+# Move up 100
+echo "+move 0 -100" | nc -u -w1 localhost 12345
+```
+
+**Button State Preservation:** The injected movement **preserves the current physical mouse button state**. If you're holding down the left button on the physical mouse, the injected movement will maintain that button press, enabling drag operations!
+
+### Mouse Click: `+click`
+
+Inject a quick left mouse button click (down + 10ms delay + up).
+
+**Format:** `+click`
+
+**Example:**
+```bash
+echo "+click" | nc -u -w1 localhost 12345
+```
+
+### Mouse Button Down: `+mousedown [button]`
+
+Press and hold a mouse button.
+
+**Format:** `+mousedown [button]`
+- `button`: Optional button number (1=left, 2=right, 3=middle). Default: 1
+
+**Examples:**
+```bash
+# Hold left button
+echo "+mousedown 1" | nc -u -w1 localhost 12345
+
+# Hold right button
+echo "+mousedown 2" | nc -u -w1 localhost 12345
+```
+
+### Mouse Button Up: `+mouseup [button]`
+
+Release a mouse button.
+
+**Format:** `+mouseup [button]`
+- `button`: Optional button number (1=left, 2=right, 3=middle). Default: 1
+
+**Examples:**
+```bash
+# Release left button
+echo "+mouseup 1" | nc -u -w1 localhost 12345
+
+# Drag operation example
+echo "+mousedown 1" | nc -u -w1 localhost 12345
+echo "+move 100 50" | nc -u -w1 localhost 12345
+echo "+move 50 25" | nc -u -w1 localhost 12345
+echo "+mouseup 1" | nc -u -w1 localhost 12345
+```
+
+### Raw Packet Injection: `[EP] [HEX_DATA]`
+
+Inject raw bytes into a specific endpoint.
+
+**Format:** `[endpoint_hex] [hex_payload]`
+- Endpoint address in hex (e.g., `81`, `82`)
+- Payload as hex bytes (space-separated or concatenated)
+
+**Examples:**
+```bash
+# Inject into endpoint 0x82
+echo "82 02000a0005000000" | nc -u -w1 localhost 12345
+
+# Space-separated hex
+echo "81 01 02 03 04" | nc -u -w1 localhost 12345
+```
+
+## Mouse Packet Format (Logitech)
+
+The Logitech mouse uses a **9-byte report format**:
+
+| Byte | Offset | Description | Values |
+|------|--------|-------------|--------|
+| 0 | 0x00 | Magic/Report ID | Always `0x02` |
+| 1 | 0x01 | Button state | `0x00`=none, `0x01`=left, `0x02`=right, `0x03`=both |
+| 2 | 0x02 | Padding | `0x00` |
+| 3 | 0x03 | X coordinate (low byte) | 16-bit signed little-endian |
+| 4 | 0x04 | X coordinate (high byte) | |
+| 5 | 0x05 | Y coordinate (low byte) | 16-bit signed little-endian |
+| 6 | 0x06 | Y coordinate (high byte) | |
+| 7 | 0x07 | Scroll wheel | `0xff`=down, `0x01`=up, `0x00`=none |
+| 8 | 0x08 | Padding | `0x00` |
+
+**Example packet:** `02 00 00 ce ff 0c 00 00 00`
+- Magic: `02`
+- Buttons: `00` (no buttons)
+- Padding: `00`
+- X: `ce ff` = -50 in little-endian (`0xFFCE`)
+- Y: `0c 00` = 12 in little-endian (`0x000C`)
+- Scroll: `00` (no scroll)
+- Padding: `00`
+
+## Button State Tracking
+
+One of the key features is **automatic button state tracking**:
+
+1. The proxy **monitors real mouse packets** from your physical mouse
+2. It extracts the **button state** (byte 1) from each packet
+3. When you inject a `+move` command, it **preserves** the current button state
+4. This allows you to **drag while injecting movement** or perform complex operations
+
+**Example workflow:**
+```bash
+# 1. Physical: Hold left mouse button on physical mouse
+# 2. UDP: Inject movement commands
+echo "+move 10 0" | nc -u -w1 localhost 12345    # Moves RIGHT while button held
+echo "+move 10 0" | nc -u -w1 localhost 12345    # Moves RIGHT while button held
+echo "+move 0 10" | nc -u -w1 localhost 12345    # Moves DOWN while button held
+# 3. Physical: Release left mouse button on physical mouse
+# Result: You've performed a drag operation!
+```
+
+## Debug Levels
+
+Use `--debug_level` to control output verbosity:
+
+- **0** (Off): No debug output, only errors
+- **1** (Basic): Shows commands received, endpoints detected
+  ```
+  [UDP] Received: +move 10 5
+  [CMD] Processing command: +move (using EP 0x82)
+  [INJ] EP 0x82: Injected 9 bytes
+  ```
+
+- **2** (Detailed): Adds command details, button states
+  ```
+  [CMD] Mouse move: X=10, Y=5 (button: 0x01)
+  [INIT] Found mouse endpoint: 0x82 (max packet: 16 bytes)
+  ```
+
+- **3** (Full Hex): Shows complete packet dumps byte-by-byte
+  ```
+  EP82(int_in): wrote 9 bytes to host: 02 01 00 0a 00 05 00 00 00
+  ```
+
+## Troubleshooting
+
+### "unrecognized option" Error
+
+Make sure you've recompiled after pulling updates:
+```bash
+make clean && make
+```
+
+### "Device or resource busy" Error
+
+Another program is using the USB device or UDC:
+```bash
+# Check what's using the UDC
+sudo lsof | grep fe980000
+
+# Kill conflicting processes or reboot
+sudo reboot
+```
+
+### "Could not find mouse endpoint"
+
+Ensure your mouse is plugged in and detected:
+```bash
+lsusb | grep -i logitech
+```
+
+### Mouse format not learned
+
+Move your physical mouse after starting the proxy. The proxy needs to see at least one real packet to learn the format.
+
+## Advanced: File-Based Injection Rules
+
+For more complex injection scenarios, use JSON rules with `--injection_file`:
+
 ```json
 {
     "control": {
@@ -195,16 +318,10 @@ For example, the following rules work with my USB mouse, and convert left click 
     },
     "int": [
         {
-            "ep_address": 81,
+            "ep_address": 130,
             "enable": true,
             "content_pattern": ["\\x01\\x00\\x00\\x00"],
             "replacement": "\\x02\\x00\\x00\\x00"
-        },
-        {
-            "ep_address": 81,
-            "enable": true,
-            "content_pattern": ["\\x02\\x00\\x00\\x00"],
-            "replacement": "\\x01\\x00\\x00\\x00"
         }
     ],
     "bulk": [],
@@ -212,48 +329,25 @@ For example, the following rules work with my USB mouse, and convert left click 
 }
 ```
 
-### Step 2: Run
+This swaps left and right clicks by replacing button byte patterns.
 
-Use the `--enable_injection` to enable this feature, and use `--injection_file` to specify the file path of your customized injection rules, if it is not specified, `usb-proxy` will use `injection.json` by default.
+## Project Structure
 
-For example
-```
-$ ./usb-proxy --device=fe980000.usb --driver=fe980000.usb --enable_injection --injection_file=myInjectionRules.json
-```
+Key files:
+- `usb-proxy.cpp` - Main entry point, argument parsing
+- `proxy.cpp` - USB proxy logic, endpoint handling
+- `udp_server.cpp` - UDP server, command processing
+- `device-libusb.cpp` - Physical USB device interaction
+- `host-raw-gadget.cpp` - Virtual USB device (gadget) side
+- `misc.cpp` - Utilities for hex parsing, descriptors
 
----
+## License
 
-## UDP Server for Injection
+Same as upstream project.
 
-The proxy includes a UDP server listening on port `12345` that allows real-time packet injection and high-level commands.
+## Credits
 
-### Usage
+Original USB proxy: https://github.com/xairy/raw-gadget
+Forked from: https://github.com/xairy/usb-proxy
 
-Start the proxy with the `--debug_udp` flag to see injection debug output:
-```bash
-sudo ./usb-proxy --debug_udp
-```
-
-### Supported Commands
-
-You can send commands to the UDP server using `netcat` or any UDP client.
-
-1.  **Raw Packet Injection**:
-    Send a string with the endpoint address (hex) followed by the payload (hex).
-    ```bash
-    # Inject payload 00010203 into endpoint 0x81
-    echo "81 00010203" | nc -u 127.0.0.1 12345
-    ```
-
-2.  **Move Mouse**:
-    Send `+move X Y` to inject a mouse movement report.
-    ```bash
-    # Move mouse by X=10, Y=20
-    echo "+move 10 20" | nc -u 127.0.0.1 12345
-    ```
-
-3.  **Click Mouse**:
-    Send `+click` to inject a left mouse click (down and up).
-    ```bash
-    echo "+click" | nc -u 127.0.0.1 12345
-    ```
+Raspberry Pi 4 + Logitech mouse optimizations and UDP injection by me (vibe-coded with very limited competence).
