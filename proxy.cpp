@@ -4,6 +4,7 @@
 #include "device-libusb.h"
 #include "proxy.h"
 #include "misc.h"
+#include "udp_server.h"
 
 void injection(struct usb_raw_transfer_io &io, Json::Value patterns, std::string replacement_hex, bool &data_modified) {
 	std::string data(io.data, io.inner.length);
@@ -234,6 +235,15 @@ void *ep_loop_read(void *arg) {
 
 				if (injection_enabled)
 					injection(io, ep, transfer_type);
+				
+				// Track real mouse button state from physical mouse (HID Mouse = protocol 2)
+				// Mouse report: byte 0 = magic (0x02), byte 1 = button state
+				if ((ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_INT &&
+				    (ep.bEndpointAddress & USB_DIR_IN) &&
+				    nbytes >= 2 && io.data[0] == 0x02) {
+					// This looks like a mouse packet, extract button state from byte 1
+					update_real_mouse_state(io.data[1]);
+				}
 
 				data_mutex->lock();
 				data_queue->push_back(io);

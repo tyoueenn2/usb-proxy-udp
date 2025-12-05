@@ -117,6 +117,9 @@ void UdpServer::handle_command(const std::string& command) {
     if (cmd == "+move") {
         int x, y;
         if (ss >> x >> y) {
+            // Get the current REAL button state from physical mouse
+            uint8_t real_button_state = g_real_mouse_button_state.load();
+            
             // Mouse report format (9 bytes, 0-indexed) - Logitech:
             // Byte 0: 02 (magic number, constant)
             // Byte 1: Button state (00 = no button, 01 = left click, etc.)
@@ -129,7 +132,7 @@ void UdpServer::handle_command(const std::string& command) {
             // Byte 8: 00 (padding)
             std::vector<uint8_t> data(9, 0);
             data[0] = 0x02;  // Magic number
-            data[1] = current_button_state;  // Use current button state
+            data[1] = real_button_state;  // Use REAL physical mouse button state
             data[2] = 0x00;  // Padding
             
             // X coordinate: 16-bit signed little-endian (bytes 3-4)
@@ -145,7 +148,7 @@ void UdpServer::handle_command(const std::string& command) {
             data[8] = 0x00;  // Padding
             
             if (debug_level >= 2) {
-                printf("[CMD] Mouse move: X=%d, Y=%d (button state: 0x%02x)\n", x, y, current_button_state);
+                printf("[CMD] Mouse move: X=%d, Y=%d (real button state: 0x%02x)\n", x, y, real_button_state);
             }
             
             inject_packet(mouse_ep, data);
