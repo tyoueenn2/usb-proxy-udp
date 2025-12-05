@@ -109,27 +109,26 @@ void UdpServer::handle_command(const std::string& command) {
     if (cmd == "+move") {
         int x, y;
         if (ss >> x >> y) {
-            // Construct mouse report matching observed format: 9 bytes
-            // Byte 0: Report ID (observed as 02 normally, use 02 for movement)
-            // Bytes 1-2: X movement (16-bit little-endian signed)
-            // Bytes 3-4: Y movement (16-bit little-endian signed)
-            // Bytes 5-6: Maybe another coordinate (set to 0)
-            // Bytes 7-8: Wheel or padding (set to 0)
+            // Mouse report format (9 bytes):
+            // Byte 0: Button state (02 = no buttons, 01 = left, etc.)
+            // Bytes 1-2: X movement (16-bit signed little-endian)
+            // Bytes 3-4: Y movement (16-bit signed little-endian)
+            // Bytes 5-8: Scroll wheel and padding
             std::vector<uint8_t> data(9, 0);
-            data[0] = 0x02;  // Report ID (observed from real packets)
+            data[0] = 0x02;  // No buttons pressed
             
-            // X coordinate: 16-bit little-endian
+            // X coordinate: 16-bit signed little-endian
             data[1] = x & 0xFF;
             data[2] = (x >> 8) & 0xFF;
             
-            // Y coordinate: 16-bit little-endian
+            // Y coordinate: 16-bit signed little-endian
             data[3] = y & 0xFF;
             data[4] = (y >> 8) & 0xFF;
             
-            // Rest already zeroed
+            // Bytes 5-8 are already zeroed (scroll wheel, padding)
             
             if (debug_level >= 2) {
-                printf("[CMD] Mouse move: X=%d, Y=%d (9-byte format)\n", x, y);
+                printf("[CMD] Mouse move: X=%d, Y=%d\n", x, y);
             }
             
             inject_packet(mouse_ep, data);
@@ -137,23 +136,22 @@ void UdpServer::handle_command(const std::string& command) {
             printf("Error: +move requires X and Y coordinates\n");
         }
     } else if (cmd == "+click") {
-        // Click: Button 1 Down, then Up
-        // Use the 9-byte format
+        // Click: Button 1 Down (bit 0 set in button state)
         std::vector<uint8_t> down(9, 0);
-        down[0] = 0x03; // Report ID with button 1? (observed 02 normally, trying 03 for click)
+        down[0] = 0x01; // Left button pressed (bit 0)
         
         if (debug_level >= 2) {
-            printf("[CMD] Mouse click (9-byte format)\n");
+            printf("[CMD] Mouse left click\n");
         }
         
         inject_packet(mouse_ep, down);
 
-        // Small delay
+        // Small delay between down and up
         usleep(10000); // 10ms
         
         // Release: All buttons up
         std::vector<uint8_t> up(9, 0);
-        up[0] = 0x02; // Back to normal report ID
+        up[0] = 0x02; // No buttons (back to normal state)
         inject_packet(mouse_ep, up);
     } else {
         printf("Error: Unknown command: %s\n", cmd.c_str());
