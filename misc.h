@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <string>
+#include <vector>
 #include <getopt.h>
 #include <signal.h>
 #include <chrono>
@@ -27,3 +28,6 @@ extern bool bmaxpacketsize0_must_greater_than_64;
 
 std::string hexToAscii(std::string input);
 int hexToDecimal(int input);
+std::vector<uint8_t> parseHexString(const std::string& hex);
+void saveUsbDescriptors(const std::string& filename);
+void printHexDump(const char* prefix, const uint8_t* data, size_t length);

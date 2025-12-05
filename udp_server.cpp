@@ -72,6 +72,10 @@ void UdpServer::server_loop() {
             packet.erase(std::remove(packet.begin(), packet.end(), '\n'), packet.end());
             packet.erase(std::remove(packet.begin(), packet.end(), '\r'), packet.end());
             
+            if (debug_level >= 1) {
+                printf("[UDP] Received: %s\n", packet.c_str());
+            }
+            
             process_packet(packet);
         }
     }
@@ -98,6 +102,10 @@ void UdpServer::handle_command(const std::string& command) {
         return;
     }
 
+    if (debug_level >= 1) {
+        printf("[CMD] Processing command: %s (using EP 0x%02x)\n", cmd.c_str(), mouse_ep);
+    }
+
     if (cmd == "+move") {
         int x, y;
         if (ss >> x >> y) {
@@ -106,12 +114,24 @@ void UdpServer::handle_command(const std::string& command) {
             std::vector<uint8_t> data(4, 0);
             data[1] = (uint8_t)x;
             data[2] = (uint8_t)y;
+            
+            if (debug_level >= 2) {
+                printf("[CMD] Mouse move: X=%d, Y=%d\n", x, y);
+            }
+            
             inject_packet(mouse_ep, data);
+        } else {
+            printf("Error: +move requires X and Y coordinates\n");
         }
     } else if (cmd == "+click") {
         // Click: Button 1 Down, then Up
         std::vector<uint8_t> down(4, 0);
         down[0] = 1; // Button 1
+        
+        if (debug_level >= 2) {
+            printf("[CMD] Mouse click\n");
+        }
+        
         inject_packet(mouse_ep, down);
 
         // Small delay? Or just send immediately?
@@ -120,15 +140,20 @@ void UdpServer::handle_command(const std::string& command) {
         std::vector<uint8_t> up(4, 0);
         up[0] = 0; // All buttons up
         inject_packet(mouse_ep, up);
+    } else {
+        printf("Error: Unknown command: %s\n", cmd.c_str());
     }
 }
 
 void UdpServer::handle_raw_injection(const std::string& data_str) {
     std::stringstream ss(data_str);
     std::string ep_str, payload_str;
-    ss >> ep_str >> payload_str;
-
-    if (ep_str.empty()) return;
+    
+    // Get the first word (endpoint)
+    if (!(ss >> ep_str)) {
+        printf("Error: No endpoint specified\n");
+        return;
+    }
 
     int ep_addr = 0;
     try {
@@ -138,31 +163,33 @@ void UdpServer::handle_raw_injection(const std::string& data_str) {
         return;
     }
 
-    // If payload is separated by space, or just one long hex string?
-    // The example was "81 00010203" -> EP 81, Data 00010203
+    // Get the remaining part as payload (can be space-separated hex)
+    std::string remaining;
+    std::getline(ss, remaining);
     
-    // If payload_str is empty, maybe the rest of the string is the payload?
-    // But ss >> payload_str only takes one word.
-    // Let's assume the format is "EP HEXDATA"
-    
-    if (payload_str.empty()) {
-         // Maybe the user sent "81 00 01 02 03"?
-         // Let's try to parse the rest of the stream
-         while (ss >> payload_str) {
-             // Append? No, let's assume standard format "EP DATA"
-             // If data is space separated, we need to handle it.
-             // But hexToAscii expects a single string.
-             // Let's concatenate if there are multiple parts?
-             // Or just assume "EP DATA_NO_SPACES"
-         }
+    // Remove leading whitespace
+    size_t start = remaining.find_first_not_of(" \t");
+    if (start != std::string::npos) {
+        remaining = remaining.substr(start);
     }
-
-    // Re-read payload from the original string to be safe?
-    // Let's just use the second word as the payload for now, assuming "EP DATA"
-    // If the user provided "81 00010203", payload_str is "00010203".
     
-    std::string payload_raw = hexToAscii(payload_str);
-    std::vector<uint8_t> data(payload_raw.begin(), payload_raw.end());
+    if (remaining.empty()) {
+        printf("Error: No payload specified\n");
+        return;
+    }
+    
+    if (debug_level >= 2) {
+        printf("[RAW] EP: 0x%02x, Payload: %s\n", ep_addr, remaining.c_str());
+    }
+    
+    // Parse hex string (handles "010203" or "01 02 03" formats)
+    std::vector<uint8_t> data = parseHexString(remaining);
+    
+    if (data.empty()) {
+        printf("Error: Could not parse payload\n");
+        return;
+    }
+    
     inject_packet(ep_addr, data);
 }
 
@@ -192,14 +219,19 @@ void UdpServer::inject_packet(int ep_addr, const std::vector<uint8_t>& data) {
                 ep->thread_info.data_queue->push_back(io);
                 ep->thread_info.data_mutex->unlock();
                 
-                if (debug_udp) {
-                    printf("EP%02x: Injected %lu bytes\n", ep_addr, data.size());
+                if (debug_level >= 1) {
+                    printf("[INJ] EP 0x%02x: Injected %lu bytes\n", ep_addr, data.size());
                 }
+                
+                if (debug_level >= 3) {
+                    printHexDump("[INJ] Data: ", data.data(), data.size());
+                }
+                
                 return;
             }
         }
     }
-    printf("Endpoint %02x not found for injection\n", ep_addr);
+    printf("Endpoint 0x%02x not found for injection\n", ep_addr);
 }
 
 int UdpServer::find_mouse_endpoint() {

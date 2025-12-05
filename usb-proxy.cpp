@@ -9,7 +9,7 @@ bool please_stop_ep0 = false;
 volatile bool please_stop_eps = false; // Use volatile to mark as atomic.
 
 bool injection_enabled = false;
-bool debug_udp = false;
+int debug_level = 0; // 0=off, 1=basic, 2=detailed, 3=full hex dumps
 std::string injection_file = "injection.json";
 Json::Value injection_config;
 
@@ -29,7 +29,8 @@ void usage() {
 	printf("\t--enable_injection: enable the injection feature\n");
 	printf("\t--injection_file: specify the file that contains injection rules\n");
 	printf("\t--enable_customized_config: enable the customized config feature\n");
-	printf("\t--debug_udp: enable debug printing for UDP injection\n\n");
+	printf("\t--debug_level: set debug verbosity (0=off, 1=basic, 2=detailed, 3=full hex)\n");
+	printf("\t--descriptor_file: file to save USB descriptors (default: usb_descriptors.json)\n\n");
 	printf("* If `device` not specified, `usb-proxy` will use `dummy_udc.0` as default device.\n");
 	printf("* If `driver` not specified, `usb-proxy` will use `dummy_udc` as default driver.\n");
 	printf("* If both `vendor_id` and `product_id` not specified, `usb-proxy` will connect\n");
@@ -165,6 +166,7 @@ int main(int argc, char **argv)
 	const char *driver = "dummy_udc";
 	int vendor_id = -1;
 	int product_id = -1;
+	std::string descriptor_file = "usb_descriptors.json";
 
 	struct sigaction action;
 	memset(&action, 0, sizeof(struct sigaction));
@@ -184,7 +186,8 @@ int main(int argc, char **argv)
 		{"enable_injection", no_argument, &lopt, 7},
 		{"injection_file", required_argument, &lopt, 8},
 		{"enable_customized_config", no_argument, &lopt, 9},
-		{"debug_udp", no_argument, &lopt, 10},
+		{"debug_level", required_argument, &lopt, 10},
+		{"descriptor_file", required_argument, &lopt, 11},
 		{0, 0, 0, 0}
 	};
 	while ((opt = getopt_long(argc, argv, optstring, long_options, &loidx)) != -1) {
@@ -225,7 +228,14 @@ int main(int argc, char **argv)
 			customized_config_enabled = true;
 			break;
 		case 10:
-			debug_udp = true;
+			debug_level = std::stoi(optarg);
+			if (debug_level < 0 || debug_level > 3) {
+				printf("Invalid debug level, must be 0-3\n");
+				return 1;
+			}
+			break;
+		case 11:
+			descriptor_file = optarg;
 			break;
 
 		default:
@@ -296,6 +306,9 @@ int main(int argc, char **argv)
 
 	setup_host_usb_desc();
 	printf("Setup USB config successfully\n");
+	
+	// Save USB descriptors to file
+	saveUsbDescriptors(descriptor_file);
 
 	int fd = usb_raw_open();
 	usb_raw_init(fd, USB_SPEED_HIGH, driver, device);
