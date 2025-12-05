@@ -12,6 +12,14 @@
 #include <algorithm>
 #include <iomanip>
 
+// Global variable to track real mouse button state from physical mouse
+std::atomic<uint8_t> g_real_mouse_button_state(0x00);
+
+// Function to update real mouse state (called from proxy.cpp)
+void update_real_mouse_state(uint8_t button_state) {
+    g_real_mouse_button_state.store(button_state);
+}
+
 UdpServer::UdpServer(int port) : port(port), sockfd(-1), running(false), current_button_state(0x00) {}
 
 UdpServer::~UdpServer() {

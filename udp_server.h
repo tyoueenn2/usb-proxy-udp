@@ -5,6 +5,13 @@
 #include <atomic>
 #include <string>
 #include <vector>
+#include <cstdint>
+
+// Global variable to track real mouse button state from physical mouse
+extern std::atomic<uint8_t> g_real_mouse_button_state;
+
+// Function to update real mouse state (called from proxy.cpp)
+void update_real_mouse_state(uint8_t button_state);
 
 class UdpServer {
 public:
@@ -21,7 +28,7 @@ private:
     std::thread server_thread;
     std::atomic<bool> running;
     
-    // Track current mouse button state
+    // Track current mouse button state (for UDP commands only)
     uint8_t current_button_state;
 
     void server_loop();
