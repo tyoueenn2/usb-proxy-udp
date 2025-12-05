@@ -2,6 +2,7 @@
 
 #include "host-raw-gadget.h"
 #include "device-libusb.h"
+#include "proxy.h"
 #include "misc.h"
 
 void injection(struct usb_raw_transfer_io &io, Json::Value patterns, std::string replacement_hex, bool &data_modified) {
