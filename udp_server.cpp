@@ -109,14 +109,27 @@ void UdpServer::handle_command(const std::string& command) {
     if (cmd == "+move") {
         int x, y;
         if (ss >> x >> y) {
-            // Construct standard mouse report: Buttons, X, Y, Wheel
-            // Assuming 4 byte report. X and Y are signed 8-bit usually.
-            std::vector<uint8_t> data(4, 0);
-            data[1] = (uint8_t)x;
-            data[2] = (uint8_t)y;
+            // Construct mouse report matching observed format: 9 bytes
+            // Byte 0: Report ID (observed as 02 normally, use 02 for movement)
+            // Bytes 1-2: X movement (16-bit little-endian signed)
+            // Bytes 3-4: Y movement (16-bit little-endian signed)
+            // Bytes 5-6: Maybe another coordinate (set to 0)
+            // Bytes 7-8: Wheel or padding (set to 0)
+            std::vector<uint8_t> data(9, 0);
+            data[0] = 0x02;  // Report ID (observed from real packets)
+            
+            // X coordinate: 16-bit little-endian
+            data[1] = x & 0xFF;
+            data[2] = (x >> 8) & 0xFF;
+            
+            // Y coordinate: 16-bit little-endian
+            data[3] = y & 0xFF;
+            data[4] = (y >> 8) & 0xFF;
+            
+            // Rest already zeroed
             
             if (debug_level >= 2) {
-                printf("[CMD] Mouse move: X=%d, Y=%d\n", x, y);
+                printf("[CMD] Mouse move: X=%d, Y=%d (9-byte format)\n", x, y);
             }
             
             inject_packet(mouse_ep, data);
@@ -125,20 +138,22 @@ void UdpServer::handle_command(const std::string& command) {
         }
     } else if (cmd == "+click") {
         // Click: Button 1 Down, then Up
-        std::vector<uint8_t> down(4, 0);
-        down[0] = 1; // Button 1
+        // Use the 9-byte format
+        std::vector<uint8_t> down(9, 0);
+        down[0] = 0x03; // Report ID with button 1? (observed 02 normally, trying 03 for click)
         
         if (debug_level >= 2) {
-            printf("[CMD] Mouse click\n");
+            printf("[CMD] Mouse click (9-byte format)\n");
         }
         
         inject_packet(mouse_ep, down);
 
-        // Small delay? Or just send immediately?
-        // In a real scenario, we might need a delay, but here we just inject.
-        // Let's inject UP immediately.
-        std::vector<uint8_t> up(4, 0);
-        up[0] = 0; // All buttons up
+        // Small delay
+        usleep(10000); // 10ms
+        
+        // Release: All buttons up
+        std::vector<uint8_t> up(9, 0);
+        up[0] = 0x02; // Back to normal report ID
         inject_packet(mouse_ep, up);
     } else {
         printf("Error: Unknown command: %s\n", cmd.c_str());
