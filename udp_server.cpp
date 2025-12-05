@@ -217,7 +217,7 @@ int UdpServer::find_mouse_endpoint() {
         
         for (int j = 0; j < alt->interface.bNumEndpoints; j++) {
             struct raw_gadget_endpoint *ep = &alt->endpoints[j];
-            if ((ep->endpoint.bmAttributes & USB_TRANSFER_TYPE_MASK) == USB_ENDPOINT_XFER_INT &&
+            if ((ep->endpoint.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_INT &&
                 (ep->endpoint.bEndpointAddress & USB_DIR_IN)) {
                 return ep->endpoint.bEndpointAddress;
             }
