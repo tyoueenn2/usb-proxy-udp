@@ -1,6 +1,6 @@
 # USB-Proxy with UDP Injection (Raspberry Pi 4 + Logitech Mouse Fork)
 
-> ⚠️ **Disclaimer**: This is a fork specifically optimized for **Raspberry Pi 4** with **Logitech mice**. The code has been "vibe coded" (iteratively developed through experimentation) due to the complexity of USB protocols and my limited competence in this area. Use at your own risk!
+> ⚠️ **Disclaimer**: This is a fork specifically optimized for **Raspberry Pi 4** with **Logitech mice**. The code has been "vibe coded" due to the complexity of USB protocols and my limited competence in this area. Use at your own risk! "It works on my machine"
 
 This software is a USB proxy based on [raw-gadget](https://github.com/xairy/raw-gadget) and libusb, with added UDP injection capabilities for remote mouse control. It allows you to:
 - Proxy USB mouse traffic between a device and host
