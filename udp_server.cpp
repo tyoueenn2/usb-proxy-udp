@@ -109,23 +109,32 @@ void UdpServer::handle_command(const std::string& command) {
     if (cmd == "+move") {
         int x, y;
         if (ss >> x >> y) {
-            // Mouse report format (9 bytes):
-            // Byte 0: Button state (02 = no buttons, 01 = left, etc.)
-            // Bytes 1-2: X movement (16-bit signed little-endian)
-            // Bytes 3-4: Y movement (16-bit signed little-endian)
-            // Bytes 5-8: Scroll wheel and padding
+            // Mouse report format (9 bytes, 0-indexed) - Logitech:
+            // Byte 0: 02 (magic number, constant)
+            // Byte 1: Button state (00 = no button, 01 = left click, etc.)
+            // Byte 2: 00 (padding)
+            // Byte 3: X low byte (16-bit signed little-endian)
+            // Byte 4: X high byte
+            // Byte 5: Y low byte (16-bit signed little-endian)
+            // Byte 6: Y high byte
+            // Byte 7: Scroll wheel (ff = down, 01 = up, 00 = no scroll)
+            // Byte 8: 00 (padding)
             std::vector<uint8_t> data(9, 0);
-            data[0] = 0x02;  // No buttons pressed
+            data[0] = 0x02;  // Magic number
+            data[1] = 0x00;  // No buttons pressed
+            data[2] = 0x00;  // Padding
             
-            // X coordinate: 16-bit signed little-endian
-            data[1] = x & 0xFF;
-            data[2] = (x >> 8) & 0xFF;
+            // X coordinate: 16-bit signed little-endian (bytes 3-4)
+            data[3] = x & 0xFF;        // X low byte
+            data[4] = (x >> 8) & 0xFF; // X high byte
             
-            // Y coordinate: 16-bit signed little-endian
-            data[3] = y & 0xFF;
-            data[4] = (y >> 8) & 0xFF;
+            // Y coordinate: 16-bit signed little-endian (bytes 5-6)
+            data[5] = y & 0xFF;        // Y low byte
+            data[6] = (y >> 8) & 0xFF; // Y high byte
             
-            // Bytes 5-8 are already zeroed (scroll wheel, padding)
+            // Scroll wheel and padding (bytes 7-8)
+            data[7] = 0x00;  // No scroll
+            data[8] = 0x00;  // Padding
             
             if (debug_level >= 2) {
                 printf("[CMD] Mouse move: X=%d, Y=%d\n", x, y);
@@ -136,9 +145,14 @@ void UdpServer::handle_command(const std::string& command) {
             printf("Error: +move requires X and Y coordinates\n");
         }
     } else if (cmd == "+click") {
-        // Click: Button 1 Down (bit 0 set in button state)
+        // Click: Left button down then up
         std::vector<uint8_t> down(9, 0);
-        down[0] = 0x01; // Left button pressed (bit 0)
+        down[0] = 0x02;  // Magic number
+        down[1] = 0x01;  // Left button pressed (bit 0)
+        down[2] = 0x00;  // Padding
+        // Bytes 3-6: X and Y = 0 (no movement)
+        down[7] = 0x00;  // No scroll
+        down[8] = 0x00;  // Padding
         
         if (debug_level >= 2) {
             printf("[CMD] Mouse left click\n");
@@ -151,7 +165,12 @@ void UdpServer::handle_command(const std::string& command) {
         
         // Release: All buttons up
         std::vector<uint8_t> up(9, 0);
-        up[0] = 0x02; // No buttons (back to normal state)
+        up[0] = 0x02;  // Magic number
+        up[1] = 0x00;  // No buttons (back to normal state)
+        up[2] = 0x00;  // Padding
+        // Bytes 3-6: X and Y = 0
+        up[7] = 0x00;  // No scroll
+        up[8] = 0x00;  // Padding
         inject_packet(mouse_ep, up);
     } else {
         printf("Error: Unknown command: %s\n", cmd.c_str());
