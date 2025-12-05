@@ -10,8 +10,8 @@ endif
 
 .PHONY: all clean
 
-usb-proxy: usb-proxy.o host-raw-gadget.o device-libusb.o proxy.o misc.o
-	g++ usb-proxy.o host-raw-gadget.o device-libusb.o proxy.o misc.o $(LDFLAG) -o usb-proxy
+usb-proxy: usb-proxy.o host-raw-gadget.o device-libusb.o proxy.o misc.o udp_server.o
+	g++ usb-proxy.o host-raw-gadget.o device-libusb.o proxy.o misc.o udp_server.o $(LDFLAG) -o usb-proxy
 
 %.o: %.cpp %.h
 	g++ $(CFLAGS) -c $<

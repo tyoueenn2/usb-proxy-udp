@@ -2,12 +2,14 @@
 #include "device-libusb.h"
 #include "proxy.h"
 #include "misc.h"
+#include "udp_server.h"
 
 int verbose_level = 0;
 bool please_stop_ep0 = false;
 volatile bool please_stop_eps = false; // Use volatile to mark as atomic.
 
 bool injection_enabled = false;
+bool debug_udp = false;
 std::string injection_file = "injection.json";
 Json::Value injection_config;
 
@@ -26,7 +28,8 @@ void usage() {
 	printf("\t--product_id: use specific product_id of USB device\n");
 	printf("\t--enable_injection: enable the injection feature\n");
 	printf("\t--injection_file: specify the file that contains injection rules\n");
-	printf("\t--enable_customized_config: enable the customized config feature\n\n");
+	printf("\t--enable_customized_config: enable the customized config feature\n");
+	printf("\t--debug_udp: enable debug printing for UDP injection\n\n");
 	printf("* If `device` not specified, `usb-proxy` will use `dummy_udc.0` as default device.\n");
 	printf("* If `driver` not specified, `usb-proxy` will use `dummy_udc` as default driver.\n");
 	printf("* If both `vendor_id` and `product_id` not specified, `usb-proxy` will connect\n");
@@ -181,6 +184,7 @@ int main(int argc, char **argv)
 		{"enable_injection", no_argument, &lopt, 7},
 		{"injection_file", required_argument, &lopt, 8},
 		{"enable_customized_config", no_argument, &lopt, 9},
+		{"debug_udp", no_argument, &lopt, 10},
 		{0, 0, 0, 0}
 	};
 	while ((opt = getopt_long(argc, argv, optstring, long_options, &loidx)) != -1) {
@@ -219,6 +223,9 @@ int main(int argc, char **argv)
 			break;
 		case 9:
 			customized_config_enabled = true;
+			break;
+		case 10:
+			debug_udp = true;
 			break;
 
 		default:
@@ -294,7 +301,13 @@ int main(int argc, char **argv)
 	usb_raw_init(fd, USB_SPEED_HIGH, driver, device);
 	usb_raw_run(fd);
 
+	UdpServer udp_server(12345);
+	udp_server.start();
+
 	ep0_loop(fd);
+
+	udp_server.stop();
+	udp_server.join();
 
 	close(fd);
 

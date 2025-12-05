@@ -26,6 +26,21 @@ This software is a USB proxy based on [raw-gadget](https://github.com/xairy/raw-
 
 ---
 
+## Building on Raspberry Pi 4
+
+1.  **Install Dependencies**:
+    ```bash
+    sudo apt-get update
+    sudo apt-get install build-essential libusb-1.0-0-dev libjsoncpp-dev
+    ```
+
+2.  **Compile**:
+    ```bash
+    make
+    ```
+
+---
+
 ## How to use
 
 ### Step 1: Prerequisite
@@ -205,3 +220,40 @@ For example
 ```
 $ ./usb-proxy --device=fe980000.usb --driver=fe980000.usb --enable_injection --injection_file=myInjectionRules.json
 ```
+
+---
+
+## UDP Server for Injection
+
+The proxy includes a UDP server listening on port `12345` that allows real-time packet injection and high-level commands.
+
+### Usage
+
+Start the proxy with the `--debug_udp` flag to see injection debug output:
+```bash
+sudo ./usb-proxy --debug_udp
+```
+
+### Supported Commands
+
+You can send commands to the UDP server using `netcat` or any UDP client.
+
+1.  **Raw Packet Injection**:
+    Send a string with the endpoint address (hex) followed by the payload (hex).
+    ```bash
+    # Inject payload 00010203 into endpoint 0x81
+    echo "81 00010203" | nc -u 127.0.0.1 12345
+    ```
+
+2.  **Move Mouse**:
+    Send `+move X Y` to inject a mouse movement report.
+    ```bash
+    # Move mouse by X=10, Y=20
+    echo "+move 10 20" | nc -u 127.0.0.1 12345
+    ```
+
+3.  **Click Mouse**:
+    Send `+click` to inject a left mouse click (down and up).
+    ```bash
+    echo "+click" | nc -u 127.0.0.1 12345
+    ```
