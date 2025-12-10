@@ -122,15 +122,20 @@ void *ep_loop_write(void *arg) {
 
 	while (!please_stop_eps) {
 		assert(ep_num != -1);
+		
+		std::unique_lock<std::mutex> lock(*data_mutex);
+		// Wait for data with 100µs timeout - wakes immediately on notify or after timeout
+		thread_info.data_cond->wait_for(lock, std::chrono::microseconds(100), 
+			[&]{ return data_queue->size() > 0 || please_stop_eps; });
+		
 		if (data_queue->size() == 0) {
-			usleep(100);
+			lock.unlock();
 			continue;
 		}
 
-		data_mutex->lock();
 		struct usb_raw_transfer_io io = data_queue->front();
 		data_queue->pop_front();
-		data_mutex->unlock();
+		lock.unlock();
 
 		if (verbose_level >= 2)
 			printData(io, ep.bEndpointAddress, transfer_type, dir);
@@ -313,6 +318,7 @@ void process_eps(int fd, int config, int interface, int altsetting) {
 		ep->thread_info.endpoint = ep->endpoint;
 		ep->thread_info.data_queue = new std::deque<usb_raw_transfer_io>;
 		ep->thread_info.data_mutex = new std::mutex;
+		ep->thread_info.data_cond = new std::condition_variable;
 
 		switch (usb_endpoint_type(&ep->endpoint)) {
 		case USB_ENDPOINT_XFER_ISOC:
@@ -368,6 +374,10 @@ void terminate_eps(int fd, int config, int interface, int altsetting) {
 		// ioctl gets interrupted with no other side-effects.
 		// The libusb transfer handling does get interrupted directly
 		// and instead times out.
+		
+		// Wake threads waiting on condition variable
+		ep->thread_info.data_cond->notify_all();
+		
 		pthread_kill(ep->thread_read, SIGUSR1);
 		pthread_kill(ep->thread_write, SIGUSR1);
 
@@ -385,6 +395,7 @@ void terminate_eps(int fd, int config, int interface, int altsetting) {
 
 		delete ep->thread_info.data_queue;
 		delete ep->thread_info.data_mutex;
+		delete ep->thread_info.data_cond;
 	}
 
 	please_stop_eps = false;

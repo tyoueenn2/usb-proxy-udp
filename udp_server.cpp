@@ -33,6 +33,27 @@ void UdpServer::start() {
         return;
     }
 
+    // Configure socket for low latency
+    // Minimize receive buffer to reduce buffering delay
+    int rcvbuf = 4096;  // Small buffer for low latency
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+        perror("setsockopt SO_RCVBUF failed (non-fatal)");
+    }
+    
+    // Set socket priority for faster processing
+    int priority = 6;  // High priority
+    if (setsockopt(sockfd, SOL_SOCKET, SO_PRIORITY, &priority, sizeof(priority)) < 0) {
+        perror("setsockopt SO_PRIORITY failed (non-fatal)");
+    }
+    
+    // Set receive timeout to prevent indefinite blocking
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        perror("setsockopt SO_RCVTIMEO failed (non-fatal)");
+    }
+
     struct sockaddr_in servaddr;
     memset(&servaddr, 0, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
@@ -297,6 +318,9 @@ void UdpServer::inject_packet(int ep_addr, const std::vector<uint8_t>& data) {
                 ep->thread_info.data_mutex->lock();
                 ep->thread_info.data_queue->push_back(io);
                 ep->thread_info.data_mutex->unlock();
+                
+                // Wake the endpoint thread immediately for low latency
+                ep->thread_info.data_cond->notify_one();
                 
                 if (debug_level >= 1) {
                     printf("[INJ] EP 0x%02x: Injected %lu bytes\n", ep_addr, data.size());
