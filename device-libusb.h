@@ -1,6 +1,8 @@
 #include <libusb-1.0/libusb.h>
 
 #include "misc.h"
+#include <vector>
+#include <utility>
 
 #define USB_REQUEST_TIMEOUT 1000
 
@@ -17,6 +19,8 @@ extern struct libusb_config_descriptor		**device_config_desc;
 extern pthread_t hotplug_monitor_thread;
 
 int connect_device(int vendorId, int productId);
+// Fetches every HID report descriptor from the opened physical device.
+std::vector<std::pair<int, std::vector<uint8_t> > > get_hid_report_descriptors();
 void reset_device();
 void set_configuration(int configuration);
 void claim_interface(int interface);

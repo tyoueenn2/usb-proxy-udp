@@ -179,6 +179,39 @@ int connect_device(int vendor_id, int product_id) {
 	return 0;
 }
 
+std::vector<std::pair<int, std::vector<uint8_t> > > get_hid_report_descriptors() {
+	std::vector<std::pair<int, std::vector<uint8_t> > > result;
+	for (int c = 0; c < device_device_desc.bNumConfigurations; ++c) {
+		const libusb_config_descriptor *config = device_config_desc[c];
+		for (int i = 0; i < config->bNumInterfaces; ++i) {
+			for (int a = 0; a < config->interface[i].num_altsetting; ++a) {
+				const libusb_interface_descriptor& iface = config->interface[i].altsetting[a];
+				if (iface.bInterfaceClass != LIBUSB_CLASS_HID || !iface.extra) continue;
+				int length = 0;
+				for (int p = 0; p + 2 <= iface.extra_length;) {
+					int item_length = iface.extra[p];
+					if (item_length < 2 || p + item_length > iface.extra_length) break;
+					// HID descriptor: report descriptor type/length begins at byte 6.
+					if ((unsigned char)iface.extra[p + 1] == 0x21 && item_length >= 9) {
+						for (int n = 0; n < (unsigned char)iface.extra[p + 5] && 6 + 3*n + 2 < item_length; ++n)
+							if ((unsigned char)iface.extra[p + 6 + 3*n] == 0x22) {
+								length = (unsigned char)iface.extra[p + 7 + 3*n] | ((unsigned char)iface.extra[p + 8 + 3*n] << 8); break;
+							}
+					}
+					p += item_length;
+				}
+				if (!length) continue;
+				std::vector<uint8_t> bytes(length);
+				int transferred = libusb_control_transfer(dev_handle, LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_STANDARD | LIBUSB_RECIPIENT_INTERFACE,
+					LIBUSB_REQUEST_GET_DESCRIPTOR, (0x22 << 8), iface.bInterfaceNumber, bytes.data(), length, USB_REQUEST_TIMEOUT);
+				if (transferred > 0) { bytes.resize(transferred); result.push_back(std::make_pair((int)iface.bInterfaceNumber, bytes)); }
+				else fprintf(stderr, "Unable to read HID report descriptor for interface %d: %s\n", iface.bInterfaceNumber, libusb_strerror((libusb_error)transferred));
+			}
+		}
+	}
+	return result;
+}
+
 void reset_device() {
 	int result = libusb_reset_device(dev_handle);
 	if (result != LIBUSB_SUCCESS) {

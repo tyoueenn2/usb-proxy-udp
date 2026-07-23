@@ -1,4 +1,4 @@
-# USB-Proxy with UDP Injection (Raspberry Pi 4 + Logitech Mouse Fork)
+# USB-Proxy with UDP Injection (Raspberry Pi 4 + HID Mouse Support)
 
 > ⚠️ **Disclaimer**: This is a fork specifically optimized for **Raspberry Pi 4** with **Logitech mice**. The code has been "vibe coded" due to the complexity of USB protocols and my limited competence in this area. Use at your own risk! "It works on my machine"
 
@@ -6,7 +6,7 @@ This software is a USB proxy based on [raw-gadget](https://github.com/xairy/raw-
 - Proxy USB mouse traffic between a device and host
 - Inject mouse movements and clicks via UDP commands
 - Preserve physical mouse button states during injection (e.g., drag while injecting movement)
-- Automatically detect and adapt to Logitech mouse packet formats
+- Read and parse HID report descriptors to adapt to a device's mouse report format automatically
 
 ## Hardware Setup
 
@@ -71,7 +71,7 @@ make
 
 ### Step 1: Find Your Mouse Details
 
-Plug your Logitech mouse into **any regular USB port** on the RPi4 (not the USB-C OTG port):
+Plug your HID mouse into **any regular USB port** on the RPi4 (not the USB-C OTG port):
 
 ```bash
 lsusb
@@ -206,9 +206,9 @@ echo "82 02000a0005000000" | nc -u -w1 localhost 12345
 echo "81 01 02 03 04" | nc -u -w1 localhost 12345
 ```
 
-## Mouse Packet Format (Logitech)
+## Automatic HID Report Parsing
 
-The Logitech mouse uses a **9-byte report format**:
+At startup the proxy fetches the HID report descriptor for each HID interface and parses relative X, Y, button, report-ID, bit-width, and logical-range fields. UDP mouse commands are encoded in that report format, so no Logitech packet layout is assumed. Devices must expose a relative X/Y mouse report. Raw packet injection remains available for vendor-defined reports and controls.
 
 | Byte | Offset | Description | Values |
 |------|--------|-------------|--------|
@@ -236,7 +236,7 @@ The Logitech mouse uses a **9-byte report format**:
 One of the key features is **automatic button state tracking**:
 
 1. The proxy **monitors real mouse packets** from your physical mouse
-2. It extracts the **button state** (byte 1) from each packet
+2. It extracts button fields using the parsed HID report descriptor
 3. When you inject a `+move` command, it **preserves** the current button state
 4. This allows you to **drag while injecting movement** or perform complex operations
 

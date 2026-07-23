@@ -306,6 +306,7 @@ int main(int argc, char **argv)
 
 	setup_host_usb_desc();
 	printf("Setup USB config successfully\n");
+	configure_hid_mouse_reports(get_hid_report_descriptors());
 	
 	// Save USB descriptors to file
 	saveUsbDescriptors(descriptor_file);
