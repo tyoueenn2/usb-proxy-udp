@@ -97,6 +97,9 @@ struct usb_raw_control_event {
 struct usb_raw_transfer_io {
 	struct usb_raw_ep_io		inner;
 	char				data[MAX_TRANSFER_SIZE];
+	// Userspace-only metadata, outside the buffer passed to the kernel.
+	uint64_t injection_deadline_ns = 0;
+	uint64_t mouse_generation = 0;
 };
 
 /*----------------------------------------------------------------------*/

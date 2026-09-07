@@ -122,12 +122,12 @@ void *ep_loop_write(void *arg) {
 
 	while (!please_stop_eps) {
 		assert(ep_num != -1);
-		
+
 		std::unique_lock<std::mutex> lock(*data_mutex);
-		// Wait for data with 100µs timeout - wakes immediately on notify or after timeout
-		thread_info.data_cond->wait_for(lock, std::chrono::microseconds(100), 
+		// Producers notify immediately; timeout only observes shutdown from a signal.
+		thread_info.data_cond->wait_for(lock, std::chrono::milliseconds(20),
 			[&]{ return data_queue->size() > 0 || please_stop_eps; });
-		
+
 		if (data_queue->size() == 0) {
 			lock.unlock();
 			continue;
@@ -136,11 +136,14 @@ void *ep_loop_write(void *arg) {
 		struct usb_raw_transfer_io io = data_queue->front();
 		data_queue->pop_front();
 		lock.unlock();
+		thread_info.data_cond->notify_all();
 
 		if (verbose_level >= 2)
 			printData(io, ep.bEndpointAddress, transfer_type, dir);
 
 		if (ep.bEndpointAddress & USB_DIR_IN) {
+			if (transfer_type == "int" && !merge_mouse_report(ep.bEndpointAddress, io))
+				continue;
 			int rv = usb_raw_ep_write(fd, (struct usb_raw_ep_io *)&io);
 			if (rv < 0 && errno == ESHUTDOWN) {
 				printf("EP%x(%s_%s): device likely reset, stopping thread\n",
@@ -168,7 +171,7 @@ void *ep_loop_write(void *arg) {
 					printf("%02x ", (unsigned char)io.data[i]);
 				}
 				printf("\n");
-			} else {
+			} else if (debug_level >= 2) {
 				printf("EP%x(%s_%s): wrote %d bytes to host\n", ep.bEndpointAddress,
 					transfer_type.c_str(), dir.c_str(), rv);
 			}
@@ -213,46 +216,50 @@ void *ep_loop_read(void *arg) {
 
 	while (!please_stop_eps) {
 		assert(ep_num != -1);
-		struct usb_raw_transfer_io io;
+		struct usb_raw_transfer_io io{};
 
 		if (ep.bEndpointAddress & USB_DIR_IN) {
 			unsigned char *data = NULL;
 			int nbytes = -1;
 
-			if (data_queue->size() >= 32) {
-				usleep(200);
-				continue;
+			{
+				std::unique_lock<std::mutex> lock(*data_mutex);
+				thread_info.data_cond->wait_for(lock, std::chrono::milliseconds(20),
+					[&]{ return data_queue->size() < 32 || please_stop_eps; });
+				if (please_stop_eps) break;
+				if (data_queue->size() >= 32) continue;
 			}
-
-			int rv = receive_data(ep.bEndpointAddress, ep.bmAttributes, usb_endpoint_maxp(&ep),
-						&data, &nbytes, USB_REQUEST_TIMEOUT);
+			// The mouse hot path receives into the report buffer without a heap allocation.
+			int rv;
+			if (transfer_type == "int")
+				rv = libusb_interrupt_transfer(dev_handle, ep.bEndpointAddress,
+					reinterpret_cast<unsigned char*>(io.data),
+					std::min<int>(usb_endpoint_maxp(&ep), sizeof(io.data)), &nbytes, 20);
+			else
+				rv = receive_data(ep.bEndpointAddress, ep.bmAttributes, usb_endpoint_maxp(&ep),
+					&data, &nbytes, USB_REQUEST_TIMEOUT);
 			if (rv == LIBUSB_ERROR_NO_DEVICE) {
 				printf("EP%x(%s_%s): device likely reset, stopping thread\n",
 					ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
 				break;
 			}
 
-			if (nbytes >= 0) {
-				memcpy(io.data, data, nbytes);
+			if (rv == LIBUSB_SUCCESS && nbytes > 0 && nbytes <= int(sizeof(io.data))) {
+				if (data) memcpy(io.data, data, nbytes);
 				io.inner.ep = ep_num;
 				io.inner.flags = 0;
 				io.inner.length = nbytes;
 
 				if (injection_enabled)
 					injection(io, ep, transfer_type);
-				
-				// Track real mouse button state from physical mouse (HID Mouse = protocol 2)
-				// Mouse report: byte 0 = magic (0x02), byte 1 = button state
-				if ((ep.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_INT &&
-				    (ep.bEndpointAddress & USB_DIR_IN) &&
-				    nbytes >= 2 && io.data[0] == 0x02) {
-					// This looks like a mouse packet, extract button state from byte 1
-					update_real_mouse_state(io.data[1]);
-				}
 
-				data_mutex->lock();
+				std::unique_lock<std::mutex> lock(*data_mutex);
+				while (data_queue->size() >= 32 && !please_stop_eps)
+					thread_info.data_cond->wait_for(lock, std::chrono::milliseconds(20));
+				if (please_stop_eps) { delete[] data; break; }
 				data_queue->push_back(io);
-				data_mutex->unlock();
+				lock.unlock();
+				thread_info.data_cond->notify_all();
 				if (verbose_level)
 					printf("EP%x(%s_%s): enqueued %d bytes to queue\n", ep.bEndpointAddress,
 							transfer_type.c_str(), dir.c_str(), nbytes);
@@ -291,6 +298,7 @@ void *ep_loop_read(void *arg) {
 			data_mutex->lock();
 			data_queue->push_back(io);
 			data_mutex->unlock();
+			thread_info.data_cond->notify_all();
 			if (verbose_level)
 				printf("EP%x(%s_%s): enqueued %d bytes to queue\n", ep.bEndpointAddress,
 						transfer_type.c_str(), dir.c_str(), rv);
@@ -307,6 +315,31 @@ void process_eps(int fd, int config, int interface, int altsetting) {
 					.interfaces[interface].altsettings[altsetting];
 
 	printf("Activating %d endpoints on interface %d\n", (int)alt->interface.bNumEndpoints, interface);
+	// Read the active interface descriptor directly, including after reconfiguration.
+	// No vendor/product lookup or traffic-based guess is used for report offsets.
+	if (alt->interface.bInterfaceClass == USB_CLASS_HID) {
+		const auto& source=device_config_desc[config]->interface[interface].altsetting[altsetting];
+		int report_length=0;
+		for(int pos=0;pos+2<=source.extra_length;) {
+			int size=source.extra[pos];
+			if(size<2 || pos+size>source.extra_length)break;
+			if(source.extra[pos+1]==0x21 && size>=9)
+				for(int entry=6;entry+3<=size;entry+=3)
+					if(source.extra[pos+entry]==0x22)
+						report_length=source.extra[pos+entry+1] | (source.extra[pos+entry+2]<<8);
+			pos+=size;
+		}
+		uint8_t report[MAX_TRANSFER_SIZE];int count=-1;
+		if(report_length>0 && report_length<=MAX_TRANSFER_SIZE)
+			count=libusb_control_transfer(dev_handle,0x81,USB_REQ_GET_DESCRIPTOR,0x2200,
+				alt->interface.bInterfaceNumber,report,report_length,USB_REQUEST_TIMEOUT);
+		learn_mouse_descriptor(alt->interface.bInterfaceNumber,report,count>0?count:0);
+		uint8_t protocol=1;
+		if(alt->interface.bInterfaceSubClass==1 && alt->interface.bInterfaceProtocol==2)
+			libusb_control_transfer(dev_handle,0xa1,0x03,0,alt->interface.bInterfaceNumber,
+				&protocol,1,USB_REQUEST_TIMEOUT);
+		set_mouse_protocol(alt->interface.bInterfaceNumber,protocol==0);
+	}
 
 	for (int i = 0; i < alt->interface.bNumEndpoints; i++) {
 		struct raw_gadget_endpoint *ep = &alt->endpoints[i];
@@ -341,6 +374,9 @@ void process_eps(int fd, int config, int interface, int altsetting) {
 			ep->thread_info.dir = "out";
 
 		ep->thread_info.ep_num = usb_raw_ep_enable(fd, &ep->thread_info.endpoint);
+		if (alt->interface.bInterfaceClass == USB_CLASS_HID &&
+		    usb_endpoint_dir_in(&ep->endpoint) && usb_endpoint_type(&ep->endpoint) == USB_ENDPOINT_XFER_INT)
+			register_mouse_endpoint(&ep->thread_info, alt->interface.bInterfaceNumber);
 		printf("%s_%s: addr = %u, ep = #%d\n",
 			ep->thread_info.transfer_type.c_str(),
 			ep->thread_info.dir.c_str(),
@@ -374,10 +410,11 @@ void terminate_eps(int fd, int config, int interface, int altsetting) {
 		// ioctl gets interrupted with no other side-effects.
 		// The libusb transfer handling does get interrupted directly
 		// and instead times out.
-		
+
+		unregister_mouse_endpoint(&ep->thread_info);
 		// Wake threads waiting on condition variable
 		ep->thread_info.data_cond->notify_all();
-		
+
 		pthread_kill(ep->thread_read, SIGUSR1);
 		pthread_kill(ep->thread_write, SIGUSR1);
 
@@ -460,6 +497,10 @@ void ep0_loop(int fd) {
 		io.inner.ep = 0;
 		io.inner.flags = 0;
 		io.inner.length = event.ctrl.wLength;
+		if (io.inner.length > sizeof(io.data)) {
+			usb_raw_ep0_stall(fd);
+			continue;
+		}
 
 		int injection_flags = USB_INJECTION_FLAG_NONE;
 		int nbytes = 0;
@@ -490,6 +531,10 @@ void ep0_loop(int fd) {
 						break;
 					}
 				}
+
+				if (event.ctrl.bRequestType == (USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_INTERFACE) &&
+				    event.ctrl.bRequest == USB_REQ_GET_DESCRIPTOR && (event.ctrl.wValue >> 8) == 0x22)
+					learn_mouse_descriptor(event.ctrl.wIndex, reinterpret_cast<uint8_t*>(io.data), io.inner.length);
 
 				// Some UDCs require bMaxPacketSize0 to be at least 64.
 				// Ideally, the information about UDC limitations needs to be
@@ -655,8 +700,20 @@ void ep0_loop(int fd) {
 						printData(io, 0x00, "control", "out");
 
 					result = control_request(&event.ctrl, &nbytes, &control_data, USB_REQUEST_TIMEOUT);
-					if (result == 0) {
-						// Ack the request.
+						if (result == 0) {
+							// HID SET_PROTOCOL: only boot-mouse interfaces use the 3-byte layout.
+							if (event.ctrl.bRequestType == (USB_TYPE_CLASS | USB_RECIP_INTERFACE) &&
+							    event.ctrl.bRequest == 0x0b && event.ctrl.wValue <= 1) {
+								auto& cfg=host_device_desc.configs[host_device_desc.current_config];
+								for(int i=0;i<cfg.config.bNumInterfaces;++i) {
+									auto& iface=cfg.interfaces[i];
+									auto& desc=iface.altsettings[iface.current_altsetting].interface;
+									if(desc.bInterfaceNumber==event.ctrl.wIndex && desc.bInterfaceClass==USB_CLASS_HID &&
+									   desc.bInterfaceSubClass==1 && desc.bInterfaceProtocol==2)
+										set_mouse_protocol(event.ctrl.wIndex,event.ctrl.wValue==0);
+								}
+							}
+							// Ack the request.
 						rv = usb_raw_ep0_read(fd, (struct usb_raw_ep_io *)&io);
 						if (rv < 0)
 							printf("ep0: ack failed: %d\n", rv);

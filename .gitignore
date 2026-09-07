@@ -1,2 +1,14 @@
 *.o
+*.d
 usb-proxy
+.tools/
+__pycache__/
+tests/protocol-test*
+!tests/protocol_test.cpp
+*.exe
+*.pdb
+.zig-cache/
+tests/udp-test
+tests/replay-test
+usb-replay
+*.jsonl

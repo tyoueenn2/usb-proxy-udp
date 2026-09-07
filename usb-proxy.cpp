@@ -3,10 +3,11 @@
 #include "proxy.h"
 #include "misc.h"
 #include "udp_server.h"
+#include "usb_capture.h"
 
 int verbose_level = 0;
 bool please_stop_ep0 = false;
-volatile bool please_stop_eps = false; // Use volatile to mark as atomic.
+std::atomic<bool> please_stop_eps{false};
 
 bool injection_enabled = false;
 int debug_level = 0; // 0=off, 1=basic, 2=detailed, 3=full hex dumps
@@ -20,6 +21,7 @@ bool bmaxpacketsize0_must_greater_than_64 = true;
 
 void usage() {
 	printf("Usage:\n");
+	printf("\t--record_usb: record host enumeration and initial mouse reports to a new JSONL file\n");
 	printf("\t-h/--help: print this help message\n");
 	printf("\t-v/--verbose: increase verbosity\n");
 	printf("\t--device: use specific device\n");
@@ -167,6 +169,7 @@ int main(int argc, char **argv)
 	int vendor_id = -1;
 	int product_id = -1;
 	std::string descriptor_file = "usb_descriptors.json";
+	std::string recording_file;
 
 	struct sigaction action;
 	memset(&action, 0, sizeof(struct sigaction));
@@ -188,6 +191,7 @@ int main(int argc, char **argv)
 		{"enable_customized_config", no_argument, &lopt, 9},
 		{"debug_level", required_argument, &lopt, 10},
 		{"descriptor_file", required_argument, &lopt, 11},
+		{"record_usb", required_argument, &lopt, 12},
 		{0, 0, 0, 0}
 	};
 	while ((opt = getopt_long(argc, argv, optstring, long_options, &loidx)) != -1) {
@@ -237,6 +241,9 @@ int main(int argc, char **argv)
 		case 11:
 			descriptor_file = optarg;
 			break;
+		case 12:
+			recording_file = optarg;
+			break;
 
 		default:
 			usage();
@@ -244,6 +251,9 @@ int main(int argc, char **argv)
 		}
 	}
 	printf("Device is: %s\n", device);
+	if(!recording_file.empty() && !capture_open(recording_file)) {
+		fprintf(stderr,"Cannot create recording (file exists or is not writable): %s\n",recording_file.c_str());return 1;
+	}
 	printf("Driver is: %s\n", driver);
 	printf("vendor_id is: %d\n", vendor_id);
 	printf("product_id is: %d\n", product_id);
@@ -306,16 +316,18 @@ int main(int argc, char **argv)
 
 	setup_host_usb_desc();
 	printf("Setup USB config successfully\n");
-	
+
 	// Save USB descriptors to file
 	saveUsbDescriptors(descriptor_file);
 
 	int fd = usb_raw_open();
-	usb_raw_init(fd, USB_SPEED_HIGH, driver, device);
+	int physical_speed=libusb_get_device_speed(libusb_get_device(dev_handle));
+	// dwc2 does not provide low-speed device mode; use full speed for low-speed mice.
+	usb_raw_init(fd, physical_speed==LIBUSB_SPEED_HIGH?USB_SPEED_HIGH:USB_SPEED_FULL, driver, device);
 	usb_raw_run(fd);
 
 	UdpServer udp_server(12345);
-	udp_server.start();
+	if (injection_enabled && !udp_server.start()) {close(fd);return 1;}
 
 	ep0_loop(fd);
 

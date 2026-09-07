@@ -15,6 +15,7 @@
 #include <linux/types.h>
 
 #include "host-raw-gadget.h"
+#include "usb_capture.h"
 
 struct raw_gadget_device host_device_desc;
 
@@ -35,6 +36,7 @@ void usb_raw_init(int fd, enum usb_device_speed speed,
 	strcpy((char *)&arg.driver_name[0], driver);
 	strcpy((char *)&arg.device_name[0], device);
 	arg.speed = speed;
+	capture_speed(speed);
 	int rv = ioctl(fd, USB_RAW_IOCTL_INIT, &arg);
 	if (rv < 0) {
 		perror("ioctl(USB_RAW_IOCTL_INIT)");
@@ -60,6 +62,11 @@ void usb_raw_event_fetch(int fd, struct usb_raw_event *event) {
 		perror("ioctl(USB_RAW_IOCTL_EVENT_FETCH)");
 		exit(EXIT_FAILURE);
 	}
+	if(event->type==USB_RAW_EVENT_CONTROL && event->length>=sizeof(usb_ctrlrequest)) {
+		auto* s=reinterpret_cast<usb_ctrlrequest*>(event->data);
+		CaptureSetup setup{s->bRequestType,s->bRequest,s->wValue,s->wIndex,s->wLength};
+		capture_event(event->type,&setup);
+	} else capture_event(event->type,nullptr);
 }
 
 int usb_raw_ep0_read(int fd, struct usb_raw_ep_io *io) {
@@ -70,6 +77,7 @@ int usb_raw_ep0_read(int fd, struct usb_raw_ep_io *io) {
 		perror("ioctl(USB_RAW_IOCTL_EP0_READ)");
 		exit(EXIT_FAILURE);
 	}
+	capture_reply("ack",io->data,rv);
 	return rv;
 }
 
@@ -79,6 +87,7 @@ int usb_raw_ep0_write(int fd, struct usb_raw_ep_io *io) {
 		perror("ioctl(USB_RAW_IOCTL_EP0_WRITE)");
 		exit(EXIT_FAILURE);
 	}
+	capture_reply("ack",io->data,rv);
 	return rv;
 }
 
@@ -187,6 +196,7 @@ void usb_raw_ep0_stall(int fd) {
 		perror("ioctl(USB_RAW_IOCTL_EP0_STALL)");
 		exit(EXIT_FAILURE);
 	}
+	capture_reply("stall",nullptr,0);
 }
 
 void usb_raw_ep_set_halt(int fd, int ep) {

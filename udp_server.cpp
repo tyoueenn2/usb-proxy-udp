@@ -1,384 +1,258 @@
 #include "udp_server.h"
 #include "host-raw-gadget.h"
-#include "proxy.h"
-#include "misc.h"
-
-#include <sys/socket.h>
-#include <netinet/in.h>
+#include "mouse_protocol.h"
+#include "usb_capture.h"
+#include <arpa/inet.h>
+#include <poll.h>
 #include <unistd.h>
-#include <iostream>
 #include <sstream>
-#include <cstring>
-#include <algorithm>
-#include <iomanip>
+#include <cstdlib>
+#include <array>
 
-// Global variable to track real mouse button state from physical mouse
-std::atomic<uint8_t> g_real_mouse_button_state(0x00);
-
-// Function to update real mouse state (called from proxy.cpp)
-void update_real_mouse_state(uint8_t button_state) {
-    g_real_mouse_button_state.store(button_state);
+namespace {
+using Clock=std::chrono::steady_clock;
+constexpr uint16_t INJECTED=0x8000;
+constexpr uint16_t LATEST=0x4000;
+uint64_t now_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count(); }
+std::mutex registry_mutex;
+struct Endpoint {
+    thread_info* info=nullptr;
+    int interface_number=0;
+    MouseProfile profile;
+    std::vector<uint8_t> latest;
+    uint8_t physical=0,synthetic=0;
+    uint64_t generation=0;
+};
+uint64_t next_generation=0;
+std::map<int,Endpoint> endpoints;
+std::map<int,std::vector<MouseProfile>> descriptors;
+std::map<int,std::vector<MouseProfile>> report_descriptors;
+std::map<int,bool> boot_protocol;
+int selected=-1;
+bool ready() {
+    std::lock_guard<std::mutex> guard(registry_mutex);
+    auto it=endpoints.find(selected);
+    return it!=endpoints.end() && !it->second.latest.empty();
 }
-
-UdpServer::UdpServer(int port) : port(port), sockfd(-1), running(false), current_button_state(0x00) {}
-
-UdpServer::~UdpServer() {
-    stop();
+bool enqueue(const MouseCommand& c, bool latest=false) {
+    std::lock_guard<std::mutex> guard(registry_mutex);
+    auto found=endpoints.find(selected);
+    if(found==endpoints.end() || found->second.latest.empty())return false;
+    auto& e=found->second;
+    auto parts=split_mouse_command(e.profile,c);
+    if(parts.empty())return false;
+    std::lock_guard<std::mutex> lock(*e.info->data_mutex);
+    auto& queue=*e.info->data_queue;
+    // Only replace consecutive aiming corrections with the same button snapshot.
+    // Physical reports, wheel events and button transitions are ordering barriers.
+    size_t keep=queue.size();
+    if(latest && !c.wheel && !c.pan) while(keep) {
+        auto& tail=queue[keep-1];
+        if(!(tail.inner.flags&LATEST) ||
+           e.profile.button_mask(reinterpret_cast<const uint8_t*>(tail.data))!=c.buttons)break;
+        --keep;
+    }
+    if(keep+parts.size()>32)return false;
+    queue.resize(keep);
+    for(const auto& part:parts) {
+        usb_raw_transfer_io io{};
+        io.inner.ep=e.info->ep_num;io.inner.flags=INJECTED;
+        if(latest&&!c.wheel&&!c.pan)io.inner.flags|=LATEST;
+        io.inner.length=e.profile.size;
+        io.injection_deadline_ns=latest ? now_ns()+25000000 : 0;
+        io.mouse_generation=e.generation;
+        std::memcpy(io.data,e.latest.data(),e.latest.size());
+        e.profile.encode(part,reinterpret_cast<uint8_t*>(io.data));
+        queue.push_back(io);
+    }
+    e.info->data_cond->notify_all();
+    return true;
 }
-
-void UdpServer::start() {
-    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd < 0) {
-        perror("socket creation failed");
-        return;
-    }
-
-    // Configure socket for low latency
-    // Minimize receive buffer to reduce buffering delay
-    int rcvbuf = 4096;  // Small buffer for low latency
-    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
-        perror("setsockopt SO_RCVBUF failed (non-fatal)");
-    }
-    
-    // Set socket priority for faster processing
-    int priority = 6;  // High priority
-    if (setsockopt(sockfd, SOL_SOCKET, SO_PRIORITY, &priority, sizeof(priority)) < 0) {
-        perror("setsockopt SO_PRIORITY failed (non-fatal)");
-    }
-    
-    // Set receive timeout to prevent indefinite blocking
-    struct timeval tv;
-    tv.tv_sec = 1;
-    tv.tv_usec = 0;
-    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-        perror("setsockopt SO_RCVTIMEO failed (non-fatal)");
-    }
-
-    struct sockaddr_in servaddr;
-    memset(&servaddr, 0, sizeof(servaddr));
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr = INADDR_ANY;
-    servaddr.sin_port = htons(port);
-
-    if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
-        perror("bind failed");
-        close(sockfd);
-        sockfd = -1;
-        return;
-    }
-
-    running = true;
-    server_thread = std::thread(&UdpServer::server_loop, this);
-    printf("UDP Server started on port %d\n", port);
+std::string state() {
+    std::lock_guard<std::mutex> lock(registry_mutex);
+    auto it=endpoints.find(selected);
+    if(it==endpoints.end()||it->second.latest.empty())return "not_ready";
+    auto& e=it->second;
+    return "state "+std::to_string(e.physical)+" "+std::to_string(e.synthetic)+" "+
+        std::to_string(e.physical|e.synthetic)+" "+std::to_string(e.profile.x.minimum)+" "+
+        std::to_string(e.profile.x.maximum)+" "+std::to_string(e.profile.y.minimum)+" "+
+        std::to_string(e.profile.y.maximum);
 }
-
+}
+// Caller holds registry_mutex. Invalidate reports encoded for the previous layout.
+static void invalidate_interface(int number) {
+    for(auto& item:endpoints)if(item.second.interface_number==number) {
+        item.second.latest.clear(); item.second.physical=item.second.synthetic=0;
+        item.second.generation=++next_generation;
+        auto* info=item.second.info;
+        std::lock_guard<std::mutex> queue_lock(*info->data_mutex);
+        auto& q=*info->data_queue;
+        q.erase(std::remove_if(q.begin(),q.end(),[](const usb_raw_transfer_io& io){return io.inner.flags&INJECTED;}),q.end());
+        info->data_cond->notify_all();
+    }
+}
+void learn_mouse_descriptor(int number,const uint8_t* data,unsigned length) {
+    auto profiles=parse_mouse_descriptor(data,length);
+    std::lock_guard<std::mutex> lock(registry_mutex);
+    report_descriptors[number]=profiles;
+    if(!boot_protocol[number]) {descriptors[number]=std::move(profiles);invalidate_interface(number);}
+}
+void set_mouse_protocol(int number,bool boot) {
+    std::lock_guard<std::mutex> lock(registry_mutex);
+    boot_protocol[number]=boot;
+    if(boot) {
+        MouseProfile p;p.size=3;
+        p.x={8,8,-127,127};p.y={16,8,-127,127};p.relative={p.x,p.y};
+        for(int i=0;i<3;++i)p.buttons[i+1]={i,1,0,1};
+        descriptors[number]={p};
+    } else descriptors[number]=report_descriptors[number];
+    invalidate_interface(number);
+}
+void register_mouse_endpoint(thread_info* info,int number) {
+    std::lock_guard<std::mutex> lock(registry_mutex);
+    Endpoint e;e.info=info;e.interface_number=number;e.generation=++next_generation;
+    endpoints[info->endpoint.bEndpointAddress]=e;
+}
+void unregister_mouse_endpoint(thread_info* info) {
+    std::lock_guard<std::mutex> lock(registry_mutex);
+    int address=info->endpoint.bEndpointAddress;
+    endpoints.erase(address);
+    if(selected==address)selected=-1;
+}
+bool merge_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
+    std::lock_guard<std::mutex> lock(registry_mutex);
+    bool injected=(io.inner.flags&INJECTED)!=0;
+    io.inner.flags&=~(INJECTED|LATEST);
+    auto found=endpoints.find(address);if(found==endpoints.end())return !injected;
+    auto& e=found->second;auto* p=reinterpret_cast<uint8_t*>(io.data);
+    if(injected && io.mouse_generation!=e.generation)return false;
+    if(!injected) {
+        for(auto& profile:descriptors[e.interface_number]) if(profile.matches(p,io.inner.length) &&
+            (e.latest.empty() || profile.id==e.profile.id)) {
+            if(e.latest.empty()) {
+                e.profile=profile;
+                capture_report(address,e.interface_number,p,io.inner.length);
+            }
+            e.latest.assign(p,p+io.inner.length);
+            e.physical=profile.button_mask(p);
+            if(selected<0)selected=address;
+            break;
+        }
+    }
+    if(e.latest.empty() || !e.profile.matches(p,io.inner.length))return !injected;
+    if(injected)e.synthetic=e.profile.button_mask(p);
+    if(injected && io.injection_deadline_ns && now_ns()>io.injection_deadline_ns)
+        for(const auto& field:e.profile.relative)field.put(p,0);
+    e.profile.put_buttons(p,e.physical|e.synthetic);
+    return true;
+}
+bool UdpServer::start() {
+    if(running)return true;
+    const char* peer=std::getenv("USB_PROXY_PEER");in_addr allowed{};
+    if(peer&&inet_pton(AF_INET,peer,&allowed)!=1){fprintf(stderr,"Invalid USB_PROXY_PEER\n");return false;}
+    sockfd=socket(AF_INET,SOCK_DGRAM,0);if(sockfd<0){perror("socket");return false;}
+    int size=65536;setsockopt(sockfd,SOL_SOCKET,SO_RCVBUF,&size,sizeof(size));
+    sockaddr_in address{};address.sin_family=AF_INET;address.sin_port=htons(port);
+    const char* bind_ip=std::getenv("USB_PROXY_BIND");
+    if(inet_pton(AF_INET,bind_ip?bind_ip:"0.0.0.0",&address.sin_addr)!=1 ||
+       bind(sockfd,reinterpret_cast<sockaddr*>(&address),sizeof(address))<0) {
+        perror("UDP bind");close(sockfd);sockfd=-1;return false;
+    }
+    running=true;server_thread=std::thread(&UdpServer::server_loop,this);
+    return true;
+}
 void UdpServer::stop() {
-    running = false;
-    if (sockfd >= 0) {
-        close(sockfd);
-        sockfd = -1;
-    }
+    running=false;join(); // poll wakes within 2 ms; never close a descriptor under recvfrom.
+    if(sockfd>=0){close(sockfd);sockfd=-1;}
 }
-
-void UdpServer::join() {
-    if (server_thread.joinable()) {
-        server_thread.join();
-    }
-}
-
+void UdpServer::join(){if(server_thread.joinable())server_thread.join();}
 void UdpServer::server_loop() {
-    char buffer[1024];
-    struct sockaddr_in cliaddr;
-    socklen_t len;
-
-    while (running) {
-        len = sizeof(cliaddr);
-        int n = recvfrom(sockfd, buffer, sizeof(buffer) - 1, 0, (struct sockaddr *)&cliaddr, &len);
-        if (n > 0) {
-            buffer[n] = '\0';
-            std::string packet(buffer);
-            // Remove newline if present
-            packet.erase(std::remove(packet.begin(), packet.end(), '\n'), packet.end());
-            packet.erase(std::remove(packet.begin(), packet.end(), '\r'), packet.end());
-            
-            if (debug_level >= 1) {
-                printf("[UDP] Received: %s\n", packet.c_str());
-            }
-            
-            process_packet(packet);
+    uint8_t requested_buttons=0;
+    sockaddr_in owner{};bool owned=false,have_sequence=false;uint32_t last_sequence=0;
+    auto last=Clock::now();std::array<Clock::time_point,8> release_at{};
+    in_addr allowed{};const char* peer=std::getenv("USB_PROXY_PEER");
+    if(peer&&inet_pton(AF_INET,peer,&allowed)!=1){fprintf(stderr,"Invalid USB_PROXY_PEER\n");return;}
+    while(running) {
+        if(!ready()) {requested_buttons=0;release_at={};owned=false;have_sequence=false;}
+        auto now=Clock::now();
+        uint8_t desired=requested_buttons;
+        for(int i=0;i<8;++i)if(release_at[i]!=Clock::time_point{}&&now>=release_at[i]) {
+            desired&=~(1u<<i);
         }
-    }
-}
-
-void UdpServer::process_packet(const std::string& packet) {
-    if (packet.empty()) return;
-
-    if (packet[0] == '+') {
-        handle_command(packet);
-    } else {
-        handle_raw_injection(packet);
-    }
-}
-
-void UdpServer::handle_command(const std::string& command) {
-    std::stringstream ss(command);
-    std::string cmd;
-    ss >> cmd;
-
-    int mouse_ep = find_mouse_endpoint();
-    if (mouse_ep == -1) {
-        printf("Error: Could not find mouse endpoint for injection\n");
-        return;
-    }
-
-    if (debug_level >= 1) {
-        printf("[CMD] Processing command: %s (using EP 0x%02x)\n", cmd.c_str(), mouse_ep);
-    }
-
-    if (cmd == "+move") {
-        int x, y;
-        if (ss >> x >> y) {
-            // Get the current REAL button state from physical mouse
-            uint8_t real_button_state = g_real_mouse_button_state.load();
-            
-            // Mouse report format (9 bytes, 0-indexed) - Logitech:
-            // Byte 0: 02 (magic number, constant)
-            // Byte 1: Button state (00 = no button, 01 = left click, etc.)
-            // Byte 2: 00 (padding)
-            // Byte 3: X low byte (16-bit signed little-endian)
-            // Byte 4: X high byte
-            // Byte 5: Y low byte (16-bit signed little-endian)
-            // Byte 6: Y high byte
-            // Byte 7: Scroll wheel (ff = down, 01 = up, 00 = no scroll)
-            // Byte 8: 00 (padding)
-            std::vector<uint8_t> data(9, 0);
-            data[0] = 0x02;  // Magic number
-            data[1] = real_button_state;  // Use REAL physical mouse button state
-            data[2] = 0x00;  // Padding
-            
-            // X coordinate: 16-bit signed little-endian (bytes 3-4)
-            data[3] = x & 0xFF;        // X low byte
-            data[4] = (x >> 8) & 0xFF; // X high byte
-            
-            // Y coordinate: 16-bit signed little-endian (bytes 5-6)
-            data[5] = y & 0xFF;        // Y low byte
-            data[6] = (y >> 8) & 0xFF; // Y high byte
-            
-            // Scroll wheel and padding (bytes 7-8)
-            data[7] = 0x00;  // No scroll
-            data[8] = 0x00;  // Padding
-            
-            if (debug_level >= 2) {
-                printf("[CMD] Mouse move: X=%d, Y=%d (real button state: 0x%02x)\n", x, y, real_button_state);
+        bool expired=owned&&now-last>std::chrono::milliseconds(250);
+        if(expired)desired=0;
+        if(desired!=requested_buttons) {
+            MouseCommand c;c.buttons=desired;
+            if(enqueue(c)) {
+                requested_buttons=desired;
+                for(int i=0;i<8;++i)if(!(desired&(1u<<i)))release_at[i]={};
             }
-            
-            inject_packet(mouse_ep, data);
+        }
+        if(expired && requested_buttons==0){owned=false;have_sequence=false;}
+        pollfd poller{sockfd,POLLIN,0};if(poll(&poller,1,2)<=0)continue;
+        uint8_t data[1024];sockaddr_in from{};socklen_t length=sizeof(from);
+        int n=recvfrom(sockfd,data,sizeof(data),MSG_TRUNC,reinterpret_cast<sockaddr*>(&from),&length);
+        if(n<=0||n>int(sizeof(data)))continue;
+        if(peer&&from.sin_addr.s_addr!=allowed.s_addr)continue;
+        auto reply=[&](const std::string& s){sendto(sockfd,s.data(),s.size(),MSG_DONTWAIT,reinterpret_cast<sockaddr*>(&from),length);};
+        std::string text(reinterpret_cast<char*>(data),n);
+        while(!text.empty()&&(text.back()=='\n'||text.back()=='\r'))text.pop_back();
+        if(text=="+state") {reply(state());continue;}
+        if(owned&&(from.sin_addr.s_addr!=owner.sin_addr.s_addr||from.sin_port!=owner.sin_port)) {reply("busy");continue;}
+        MouseCommand c;c.buttons=requested_buttons;
+        bool valid=false,binary=false;uint32_t seq=0;int click=-1, cancel_timer=-1;
+        // UPX1, sequence:u32be, dx:i16be, dy:i16be, wheel:i8, pan:i8, buttons:u8, reserved:0.
+        if(n==16&&std::memcmp(data,"UPX1",4)==0) {
+            binary=true;seq=read_be32(data+4);
+            if(data[15] || (have_sequence&&!sequence_newer(seq,last_sequence)))continue;
+            c.x=read_i16(data+8);c.y=read_i16(data+10);
+            c.wheel=data[12]<128?data[12]:int(data[12])-256;
+            c.pan=data[13]<128?data[13]:int(data[13])-256;c.buttons=data[14];valid=true;
         } else {
-            printf("Error: +move requires X and Y coordinates\n");
-        }
-    } else if (cmd == "+click") {
-        // Click: Left button down then up
-        std::vector<uint8_t> down(9, 0);
-        down[0] = 0x02;  // Magic number
-        down[1] = 0x01;  // Left button pressed (bit 0)
-        down[2] = 0x00;  // Padding
-        // Bytes 3-6: X and Y = 0 (no movement)
-        down[7] = 0x00;  // No scroll
-        down[8] = 0x00;  // Padding
-        
-        if (debug_level >= 2) {
-            printf("[CMD] Mouse left click\n");
-        }
-        
-        inject_packet(mouse_ep, down);
-
-        // Small delay between down and up
-        usleep(10000); // 10ms
-        
-        // Release: All buttons up
-        std::vector<uint8_t> up(9, 0);
-        up[0] = 0x02;  // Magic number
-        up[1] = 0x00;  // No buttons (back to normal state)
-        up[2] = 0x00;  // Padding
-        // Bytes 3-6: X and Y = 0
-        up[7] = 0x00;  // No scroll
-        up[8] = 0x00;  // Padding
-        inject_packet(mouse_ep, up);
-    } else if (cmd == "+mousedown") {
-        // Press and hold mouse button
-        int button = 1; // Default to left button
-        ss >> button; // Optional: read button number
-        
-        current_button_state |= (1 << (button - 1)); // Set button bit
-        
-        std::vector<uint8_t> data(9, 0);
-        data[0] = 0x02;  // Magic number
-        data[1] = current_button_state;
-        data[2] = 0x00;  // Padding
-        // Bytes 3-8: no movement or scroll
-        
-        if (debug_level >= 2) {
-            printf("[CMD] Mouse button %d down (state: 0x%02x)\n", button, current_button_state);
-        }
-        
-        inject_packet(mouse_ep, data);
-    } else if (cmd == "+mouseup") {
-        // Release mouse button
-        int button = 1; // Default to left button
-        ss >> button; // Optional: read button number
-        
-        current_button_state &= ~(1 << (button - 1)); // Clear button bit
-        
-        std::vector<uint8_t> data(9, 0);
-        data[0] = 0x02;  // Magic number
-        data[1] = current_button_state;
-        data[2] = 0x00;  // Padding
-        // Bytes 3-8: no movement or scroll
-        
-        if (debug_level >= 2) {
-            printf("[CMD] Mouse button %d up (state: 0x%02x)\n", button, current_button_state);
-        }
-        
-        inject_packet(mouse_ep, data);
-    } else {
-        printf("Error: Unknown command: %s\n", cmd.c_str());
-    }
-}
-
-void UdpServer::handle_raw_injection(const std::string& data_str) {
-    std::stringstream ss(data_str);
-    std::string ep_str, payload_str;
-    
-    // Get the first word (endpoint)
-    if (!(ss >> ep_str)) {
-        printf("Error: No endpoint specified\n");
-        return;
-    }
-
-    int ep_addr = 0;
-    try {
-        ep_addr = std::stoi(ep_str, nullptr, 16);
-    } catch (...) {
-        printf("Invalid endpoint address: %s\n", ep_str.c_str());
-        return;
-    }
-
-    // Get the remaining part as payload (can be space-separated hex)
-    std::string remaining;
-    std::getline(ss, remaining);
-    
-    // Remove leading whitespace
-    size_t start = remaining.find_first_not_of(" \t");
-    if (start != std::string::npos) {
-        remaining = remaining.substr(start);
-    }
-    
-    if (remaining.empty()) {
-        printf("Error: No payload specified\n");
-        return;
-    }
-    
-    if (debug_level >= 2) {
-        printf("[RAW] EP: 0x%02x, Payload: %s\n", ep_addr, remaining.c_str());
-    }
-    
-    // Parse hex string (handles "010203" or "01 02 03" formats)
-    std::vector<uint8_t> data = parseHexString(remaining);
-    
-    if (data.empty()) {
-        printf("Error: Could not parse payload\n");
-        return;
-    }
-    
-    inject_packet(ep_addr, data);
-}
-
-void UdpServer::inject_packet(int ep_addr, const std::vector<uint8_t>& data) {
-    // Find the endpoint queue
-    struct raw_gadget_config *config = &host_device_desc.configs[host_device_desc.current_config];
-    
-    for (int i = 0; i < config->config.bNumInterfaces; i++) {
-        struct raw_gadget_interface *iface = &config->interfaces[i];
-        struct raw_gadget_altsetting *alt = &iface->altsettings[iface->current_altsetting];
-        
-        for (int j = 0; j < alt->interface.bNumEndpoints; j++) {
-            struct raw_gadget_endpoint *ep = &alt->endpoints[j];
-            if (ep->endpoint.bEndpointAddress == ep_addr) {
-                // Found it
-                struct usb_raw_transfer_io io;
-                io.inner.ep = ep->thread_info.ep_num;
-                io.inner.flags = 0;
-                io.inner.length = data.size();
-                if (data.size() > sizeof(io.data)) {
-                    printf("Packet too large for injection: %lu\n", data.size());
-                    return;
-                }
-                memcpy(io.data, data.data(), data.size());
-
-                ep->thread_info.data_mutex->lock();
-                ep->thread_info.data_queue->push_back(io);
-                ep->thread_info.data_mutex->unlock();
-                
-                // Wake the endpoint thread immediately for low latency
-                ep->thread_info.data_cond->notify_one();
-                
-                if (debug_level >= 1) {
-                    printf("[INJ] EP 0x%02x: Injected %lu bytes\n", ep_addr, data.size());
-                }
-                
-                if (debug_level >= 3) {
-                    printHexDump("[INJ] Data: ", data.data(), data.size());
-                }
-                
-                return;
+            // A documented ASCII subset; not MAKCU V2 wire compatibility.
+            if(text.rfind("km.",0)==0)text=text.substr(2);
+            if(!text.empty()&&text[0]=='.') {
+                auto at=text.find('(');
+                if(at==std::string::npos||text.back()!=')'){reply("error syntax");continue;}
+                text="+"+text.substr(1,at-1)+" "+text.substr(at+1,text.size()-at-2);
+                std::replace(text.begin(),text.end(),',',' ');
             }
-        }
-    }
-    printf("Endpoint 0x%02x not found for injection\n", ep_addr);
-}
-
-int UdpServer::find_mouse_endpoint() {
-    // Look for HID Mouse: bInterfaceClass=3 (HID), bInterfaceProtocol=2 (Mouse)
-    
-    struct raw_gadget_config *config = &host_device_desc.configs[host_device_desc.current_config];
-    
-    for (int i = 0; i < config->config.bNumInterfaces; i++) {
-        struct raw_gadget_interface *iface = &config->interfaces[i];
-        struct raw_gadget_altsetting *alt = &iface->altsettings[iface->current_altsetting];
-        
-        // Check if this is a HID Mouse interface (Class 3, Protocol 2)
-        if (alt->interface.bInterfaceClass == 3 && alt->interface.bInterfaceProtocol == 2) {
-            // Found HID Mouse interface, return its interrupt IN endpoint
-            for (int j = 0; j < alt->interface.bNumEndpoints; j++) {
-                struct raw_gadget_endpoint *ep = &alt->endpoints[j];
-                if ((ep->endpoint.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_INT &&
-                    (ep->endpoint.bEndpointAddress & USB_DIR_IN)) {
-                    if (debug_level >= 2) {
-                        printf("[INIT] Found mouse endpoint: 0x%02x (max packet: %d bytes)\n", 
-                               ep->endpoint.bEndpointAddress, ep->endpoint.wMaxPacketSize);
-                    }
-                    return ep->endpoint.bEndpointAddress;
+            std::istringstream stream(text);std::string cmd,extra;stream>>cmd;
+            int button=1,value=0;
+            if(cmd=="+move")valid=bool(stream>>c.x>>c.y);
+            else if(cmd=="+wheel")valid=bool(stream>>c.wheel);
+            else if(cmd=="+pan")valid=bool(stream>>c.pan);
+            else if(cmd=="+release") {c.buttons=0;valid=true;}
+            else if(cmd=="+mousedown"||cmd=="+mouseup"||cmd=="+click") {
+                stream>>std::ws;
+                if(stream.eof())stream.clear();
+                else if(!(stream>>button)){reply("error button");continue;}
+                valid=button>=1&&button<=8;
+                if(valid) {
+                    if(cmd=="+mouseup")c.buttons&=~(1u<<(button-1));
+                    else c.buttons|=1u<<(button-1);
+                    if(cmd=="+click") {click=button-1;if(requested_buttons&(1u<<click))valid=false;}
+                    else cancel_timer=button-1;
+                }
+            } else {
+                const char* names[]={"+left","+right","+middle","+side1","+side2"};
+                for(int i=0;i<5;++i)if(cmd==names[i]) {
+                    valid=bool(stream>>value)&&(value==0||value==1);
+                    if(valid){c.buttons=uint8_t((c.buttons&~(1u<<i))|(unsigned(value)<<i));cancel_timer=i;}
                 }
             }
+            if(stream>>extra)valid=false;
+        }
+        if(!valid){reply("error command");continue;}
+        if(!enqueue(c,binary)){reply("error not_ready_range_or_queue_full");continue;}
+        requested_buttons=c.buttons;owner=from;owned=true;last=Clock::now();
+        if(binary){last_sequence=seq;have_sequence=true;release_at={};}
+        else {
+            for(int i=0;i<8;++i)if(!(c.buttons&(1u<<i)))release_at[i]={};
+            if(cancel_timer>=0)release_at[cancel_timer]={};
+            if(click>=0)release_at[click]=last+std::chrono::milliseconds(10);
+            reply("ok");
         }
     }
-    
-    if (debug_level >= 1) {
-        printf("[WARN] No HID Mouse interface found, falling back to first Interrupt IN\n");
-    }
-    
-    // Fallback: Find first Interrupt IN endpoint
-    for (int i = 0; i < config->config.bNumInterfaces; i++) {
-        struct raw_gadget_interface *iface = &config->interfaces[i];
-        struct raw_gadget_altsetting *alt = &iface->altsettings[iface->current_altsetting];
-        
-        for (int j = 0; j < alt->interface.bNumEndpoints; j++) {
-            struct raw_gadget_endpoint *ep = &alt->endpoints[j];
-            if ((ep->endpoint.bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_INT &&
-                (ep->endpoint.bEndpointAddress & USB_DIR_IN)) {
-                return ep->endpoint.bEndpointAddress;
-            }
-        }
-    }
-    return -1;
+    MouseCommand release;enqueue(release);requested_buttons=0;
 }

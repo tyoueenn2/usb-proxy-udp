@@ -1,44 +1,24 @@
-#ifndef UDP_SERVER_H
-#define UDP_SERVER_H
-
-#include <thread>
+#pragma once
 #include <atomic>
-#include <string>
-#include <vector>
+#include <thread>
 #include <cstdint>
-
-// Global variable to track real mouse button state from physical mouse
-extern std::atomic<uint8_t> g_real_mouse_button_state;
-
-// Function to update real mouse state (called from proxy.cpp)
-void update_real_mouse_state(uint8_t button_state);
-
+struct thread_info;
+struct usb_raw_transfer_io;
+void register_mouse_endpoint(thread_info* info, int interface_number);
+void learn_mouse_descriptor(int interface_number, const uint8_t* data, unsigned length);
+void set_mouse_protocol(int interface_number, bool boot);
+void unregister_mouse_endpoint(thread_info* info);
+bool merge_mouse_report(uint8_t endpoint, usb_raw_transfer_io& io);
 class UdpServer {
 public:
-    UdpServer(int port);
-    ~UdpServer();
-
-    void start();
+    explicit UdpServer(int port) : port(port) {}
+    ~UdpServer() { stop(); }
+    bool start();
     void stop();
     void join();
-
 private:
-    int port;
-    int sockfd;
+    int port, sockfd = -1;
+    std::atomic<bool> running{false};
     std::thread server_thread;
-    std::atomic<bool> running;
-    
-    // Track current mouse button state (for UDP commands only)
-    uint8_t current_button_state;
-
     void server_loop();
-    void process_packet(const std::string& packet);
-    void handle_command(const std::string& command);
-    void handle_raw_injection(const std::string& data);
-    void inject_packet(int ep_addr, const std::vector<uint8_t>& data);
-    
-    // Helper to find mouse endpoint
-    int find_mouse_endpoint();
 };
-
-#endif // UDP_SERVER_H
