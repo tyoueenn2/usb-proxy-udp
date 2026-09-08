@@ -1,8 +1,26 @@
 # USB Proxy UDP — Raspberry Pi mouse proxy and replay
 
+## Windows YOLO11 receiver
+
+The [receiver application](receiver/README.md) receives configurable raw UDP frames,
+runs YOLO11 using CUDA/TensorRT, and sends relative mouse corrections through this
+Pi proxy. It includes a Dear ImGui/DirectX 11 GUI, headless mode, saved profiles,
+a sample YOLO11n ONNX model, a synthetic sender, and a loopback Pi simulator.
+
+- [Build and setup](receiver/README.md)
+- [Frame and telemetry protocols](receiver/docs/PROTOCOL.md)
+- [Validation status and remaining hardware checks](receiver/docs/VALIDATION.md)
+
+The production receiver targets Windows 11, RTX 3060 Ti, CUDA 12.9, and TensorRT
+10.13. Builds without TensorRT support explicit loopback simulation only.
+This proxy now supports UPS1/UPT1 physical-button telemetry while preserving
+existing UPX1 and ASCII commands. Real target-PC screen capture remains a separate
+implementation; the included sender generates/replays test frames.
+
+
 Forward a USB mouse through a Raspberry Pi 4, control it over Ethernet, or record its USB enumeration and emulate its HID mouse interface without the physical mouse attached.
 
-The target PC communicates with a USB HID device through the Pi's USB device port. A separate controller sends movement and button commands to the Pi over UDP. Image capture, video transport, YOLO inference, and CUDA processing belong on the controller PC and are outside this repository.
+The target PC communicates with a USB HID device through the Pi's USB device port. A separate controller sends movement and button commands to the Pi over UDP. The Windows controller implementation is in `receiver/`; real desktop capture remains outside this first delivery.
 
 ## Operating modes
 

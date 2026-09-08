@@ -1,5 +1,34 @@
 # UDP mouse control
 
+## Receiver telemetry extension (UPS1/UPT1)
+
+This checkout adds optional status subscriptions for the Windows YOLO receiver.
+Existing UPX1 commands and ASCII behavior are unchanged. A subscription does not
+acquire or renew mouse-command ownership. The receiver requires this extension
+for activation from the physical mouse.
+
+Send 24 bytes to the same UDP port:
+
+`UPS1 | reserved:u32be=0 | receiver_session:u64be | increasing_token:u64be`
+
+Session/token must be nonzero. Renew every 20 ms; the subscription expires after
+100 ms. One subscriber endpoint is allowed; competing endpoints receive `busy`.
+The UDP worker publishes a status change on its next iteration (poll <=2 ms),
+on renewal, and otherwise every 10 ms. USB forwarding never sends telemetry.
+
+The 56-byte reply is:
+
+`UPT1 | ready:u8 | physical_buttons:u8 | reserved:u16=0 | receiver_session:u64be | server_session:u64be | token:u64be | sequence:u32be | xmin:i32be | xmax:i32be | ymin:i32be | ymax:i32be | reserved:u32=0`
+
+The receiver rejects old sequences, mismatched sessions, and stale echoed tokens.
+The button mask reports only physical buttons. `ready=0` represents a mouse that
+has not been learned or is disconnected. Like `+state`, status reflects processed
+reports, not proof of host USB delivery. Tokens provide freshness correlation,
+not authentication. The `USB_PROXY_PEER` restriction also applies to subscriptions.
+
+`make test` includes the telemetry codec test and real UDP server subscription,
+physical-button update, and expiry checks. Run these on Linux/Pi before deploying.
+
 ## Start and connect
 
 Build and start the Pi proxy as shown in [README.md](README.md). UDP listens on port **12345** only with `--enable_injection`. `USB_PROXY_BIND` selects the local IPv4 address (default `0.0.0.0`). `USB_PROXY_PEER` optionally restricts control to one source IPv4 address. This is an unauthenticated LAN protocol; the IP restriction is not cryptographic authentication.

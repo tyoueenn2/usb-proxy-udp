@@ -2,6 +2,7 @@
 #include "udp_server.h"
 #include <arpa/inet.h>
 #include <thread>
+#include "telemetry_protocol.h"
 
 // Exercises the real UDP server and endpoint merger without USB hardware.
 int main() {
@@ -60,6 +61,21 @@ int main() {
     {std::lock_guard<std::mutex> lock(mutex);queue.front().injection_deadline_ns=1;}
     auto expired=pop();assert(expired.data[1]==0 && expired.data[0]==1);
     assert(command("+release")=="ok");assert(pop().data[0]==0);
+    std::array<uint8_t,24> watch{};std::memcpy(watch.data(),"UPS1",4);
+    proxy_telemetry::put64(watch.data()+8,123);proxy_telemetry::put64(watch.data()+16,456);
+    assert(send(fd,watch.data(),watch.size(),0)==ssize_t(watch.size()));
+    std::array<uint8_t,56> status{};
+    assert(recv(fd,status.data(),status.size(),0)==56);
+    assert(!std::memcmp(status.data(),"UPT1",4)&&status[4]==1);
+    assert(proxy_telemetry::u64(status.data()+8)==123&&proxy_telemetry::u64(status.data()+24)==456);
+    physical.data[0]=2;assert(merge_mouse_report(0x81,physical));
+    bool observed=false;
+    for(int i=0;i<10&&!observed;++i){assert(recv(fd,status.data(),status.size(),0)==56);observed=status[5]==2;}
+    assert(observed); // Physical hold appears in telemetry; no injected hold is added.
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    while(recv(fd,status.data(),status.size(),MSG_DONTWAIT)>0){}
+    timeval short_timeout{0,30000};setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&short_timeout,sizeof(short_timeout));
+    assert(recv(fd,status.data(),status.size(),0)<0); // Subscription expires without renewal.
     server.stop();close(fd);unregister_mouse_endpoint(&info);
     puts("UDP integration: splitting, buttons, timers, watchdog, sequencing and freshness passed");
 }

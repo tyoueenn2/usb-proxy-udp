@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "bind_ip": "0.0.0.0",
+  "sender_ip": "127.0.0.1",
+  "pi_ip": "127.0.0.1",
+  "frame_port": 5000,
+  "pi_port": 12345,
+  "input_size": 320,
+  "confidence": 0.45,
+  "nms_iou": 0.45,
+  "fov_radius": 160,
+  "gain_x": 0.2,
+  "gain_y": 0.2,
+  "max_step": 32,
+  "activation_button": 2,
+  "max_age_ms": 50
+}
