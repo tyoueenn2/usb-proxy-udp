@@ -26,8 +26,6 @@ usb-replay: usb_replay.o host-raw-gadget.o udp_server.o usb_capture.o
 	$(CXX) $(CFLAGS) $(CXXFLAGS) -c $<
 
 test:
-	$(CXX) -std=c++17 -Wall -Wextra -Werror -I. tests/telemetry_test.cpp -o tests/telemetry-test
-	./tests/telemetry-test
 	$(CXX) -std=c++17 -Wall -Wextra -Werror -I. tests/protocol_test.cpp -o tests/protocol-test
 	./tests/protocol-test
 	$(CXX) -std=c++17 -Wall -Wextra -I. tests/udp_test.cpp udp_server.cpp usb_capture.cpp -pthread -ljsoncpp -o tests/udp-test

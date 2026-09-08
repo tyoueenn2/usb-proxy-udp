@@ -9,7 +9,6 @@ tests/protocol-test*
 *.pdb
 .zig-cache/
 tests/udp-test
-tests/telemetry-test
 tests/replay-test
 usb-replay
 *.jsonl

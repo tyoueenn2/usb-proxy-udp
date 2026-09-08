@@ -1,9 +1,0 @@
-{
-  "version": 6,
-  "configurePresets": [
-    {"name":"windows-tests","generator":"Visual Studio 17 2022","architecture":"x64","binaryDir":"${sourceDir}/build/tests","cacheVariables":{"RECEIVER_TENSORRT":"OFF","RECEIVER_GUI":"ON"}},
-    {"name":"windows-cuda","inherits":"windows-tests","binaryDir":"${sourceDir}/build/cuda","cacheVariables":{"RECEIVER_TENSORRT":"ON","TENSORRT_ROOT":"$env{TENSORRT_ROOT}"}}
-  ],
-  "buildPresets":[{"name":"windows-tests","configurePreset":"windows-tests","configuration":"Release"},{"name":"windows-cuda","configurePreset":"windows-cuda","configuration":"Release"}],
-  "testPresets":[{"name":"windows-tests","configurePreset":"windows-tests","configuration":"Release","output":{"outputOnFailure":true}},{"name":"windows-cuda","configurePreset":"windows-cuda","configuration":"Release","output":{"outputOnFailure":true}}]
-}

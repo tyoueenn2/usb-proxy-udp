@@ -8,8 +8,6 @@
 #include <sstream>
 #include <cstdlib>
 #include <array>
-#include <random>
-#include "telemetry_protocol.h"
 
 namespace {
 using Clock=std::chrono::steady_clock;
@@ -79,13 +77,6 @@ std::string state() {
         std::to_string(e.physical|e.synthetic)+" "+std::to_string(e.profile.x.minimum)+" "+
         std::to_string(e.profile.x.maximum)+" "+std::to_string(e.profile.y.minimum)+" "+
         std::to_string(e.profile.y.maximum);
-}
-proxy_telemetry::Snapshot telemetry_snapshot() {
-    std::lock_guard<std::mutex> lock(registry_mutex);
-    auto it=endpoints.find(selected);
-    if(it==endpoints.end()||it->second.latest.empty())return {};
-    auto& e=it->second;
-    return {true,e.physical,e.profile.x.minimum,e.profile.x.maximum,e.profile.y.minimum,e.profile.y.maximum};
 }
 }
 // Caller holds registry_mutex. Invalidate reports encoded for the previous layout.
@@ -176,29 +167,12 @@ void UdpServer::stop() {
 }
 void UdpServer::join(){if(server_thread.joinable())server_thread.join();}
 void UdpServer::server_loop() {
-    std::random_device random;
-    const uint64_t telemetry_session=(uint64_t(random())<<32|random())|1;
-    proxy_telemetry::Subscription subscription;
-    proxy_telemetry::Snapshot previous_snapshot;
-    sockaddr_in subscriber{};
-    uint64_t last_telemetry=0;
     uint8_t requested_buttons=0;
     sockaddr_in owner{};bool owned=false,have_sequence=false;uint32_t last_sequence=0;
     auto last=Clock::now();std::array<Clock::time_point,8> release_at{};
     in_addr allowed{};const char* peer=std::getenv("USB_PROXY_PEER");
     if(peer&&inet_pton(AF_INET,peer,&allowed)!=1){fprintf(stderr,"Invalid USB_PROXY_PEER\n");return;}
     while(running) {
-        // Network publication lives on this worker, never on the USB writer.
-        // A physical state change is observed on the next loop (poll <= 2 ms).
-        auto telemetry_now=now_ns();
-        if(subscription.alive(telemetry_now)) {
-            auto snapshot=telemetry_snapshot();
-            if(!(snapshot==previous_snapshot)||telemetry_now-last_telemetry>=10000000) {
-                auto packet=subscription.packet(telemetry_session,snapshot);
-                sendto(sockfd,packet.data(),packet.size(),MSG_DONTWAIT,reinterpret_cast<sockaddr*>(&subscriber),sizeof(subscriber));
-                previous_snapshot=snapshot;last_telemetry=telemetry_now;
-            }
-        }
         if(!ready()) {requested_buttons=0;release_at={};owned=false;have_sequence=false;}
         auto now=Clock::now();
         uint8_t desired=requested_buttons;
@@ -221,11 +195,6 @@ void UdpServer::server_loop() {
         if(n<=0||n>int(sizeof(data)))continue;
         if(peer&&from.sin_addr.s_addr!=allowed.s_addr)continue;
         auto reply=[&](const std::string& s){sendto(sockfd,s.data(),s.size(),MSG_DONTWAIT,reinterpret_cast<sockaddr*>(&from),length);};
-        if(n>=4&&std::memcmp(data,"UPS1",4)==0) {
-            if(subscription.alive(now_ns())&&(subscriber.sin_addr.s_addr!=from.sin_addr.s_addr||subscriber.sin_port!=from.sin_port)){reply("busy");continue;}
-            if(subscription.accept(data,size_t(n),now_ns())) {subscriber=from;last_telemetry=0;}
-            continue; // Does not acquire or renew the movement ownership lease.
-        }
         std::string text(reinterpret_cast<char*>(data),n);
         while(!text.empty()&&(text.back()=='\n'||text.back()=='\r'))text.pop_back();
         if(text=="+state") {reply(state());continue;}
