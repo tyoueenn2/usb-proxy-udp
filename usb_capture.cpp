@@ -42,7 +42,8 @@ void capture_speed(int speed) {
     Json::Value record;record["kind"]="speed";record["value"]=speed;write(record);
 }
 void capture_event(unsigned type,const CaptureSetup* request) {
-    if(!enabled)return;std::lock_guard<std::mutex> lock(mutex);
+    if(!enabled)return;
+    std::lock_guard<std::mutex> lock(mutex);
     Json::Value record;record["kind"]="event";record["type"]=type;
     pending=Json::Value();
     if(request) {
@@ -53,13 +54,15 @@ void capture_event(unsigned type,const CaptureSetup* request) {
     write(record);
 }
 void capture_reply(const char* status,const void* data,unsigned size) {
-    if(!enabled)return;std::lock_guard<std::mutex> lock(mutex);
+    if(!enabled)return;
+    std::lock_guard<std::mutex> lock(mutex);
     if(pending.isNull())return;
     Json::Value record;record["kind"]="control";record["setup"]=pending;
     record["status"]=status;record["data"]=hex(data,size);write(record);pending=Json::Value();
 }
 void capture_report(unsigned endpoint,unsigned interface_number,const void* data,unsigned size) {
-    if(!enabled)return;std::lock_guard<std::mutex> lock(mutex);
+    if(!enabled)return;
+    std::lock_guard<std::mutex> lock(mutex);
     Json::Value record;record["kind"]="mouse_report";record["endpoint"]=endpoint;
     record["interface"]=interface_number;record["data"]=hex(data,size);write(record);
 }
