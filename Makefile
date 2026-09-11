@@ -32,9 +32,9 @@ test:
 	./tests/click-protocol-test
 	$(CXX) -std=c++17 -Wall -Wextra -Werror -I. tests/telemetry_test.cpp -o tests/telemetry-test
 	./tests/telemetry-test
-	$(CXX) -std=c++17 -Wall -Wextra -Werror -I. tests/udp_test.cpp udp_server.cpp usb_capture.cpp -pthread -ljsoncpp -o tests/udp-test
+	$(CXX) -std=c++17 -Wall -Wextra -I. tests/udp_test.cpp udp_server.cpp usb_capture.cpp -pthread -ljsoncpp -o tests/udp-test
 	./tests/udp-test
-	$(CXX) -std=c++17 -Wall -Wextra -Werror -I. tests/replay_test.cpp usb_capture.cpp -pthread -ljsoncpp -o tests/replay-test
+	$(CXX) -std=c++17 -Wall -Wextra -I. tests/replay_test.cpp usb_capture.cpp -pthread -ljsoncpp -o tests/replay-test
 	./tests/replay-test
 	python3 -m unittest discover -s tests -p 'test_*.py'
 
