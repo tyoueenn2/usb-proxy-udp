@@ -34,8 +34,11 @@ void write_endpoint(Endpoint* e) {
             } else {io=e->queue.front();e->queue.pop_front();}
         }
         e->cond.notify_all();
-        if(!timed&&!merge_mouse_report(e->info.endpoint.bEndpointAddress,io))continue;
+        if(!timed&&!merge_mouse_report(e->info.endpoint.bEndpointAddress,io)) {
+            notify_mouse_report_written(e->info.endpoint.bEndpointAddress,io,false);continue;
+        }
         int result=usb_raw_ep_write(e->info.fd,&io.inner);
+        if(!timed)notify_mouse_report_written(e->info.endpoint.bEndpointAddress,io,result>=0);
         if(result<0)break;
         std::lock_guard<std::mutex> lock(e->mutex);
         e->last=io;
@@ -84,6 +87,10 @@ int main(int argc,char** argv) {
                 memcpy(&e->info.endpoint,spec.descriptor.data(),7);
                 e->info.fd=fd;e->info.data_queue=&e->queue;e->info.data_mutex=&e->mutex;e->info.data_cond=&e->cond;
                 e->info.ep_num=usb_raw_ep_enable(fd,&e->info.endpoint);
+                if(profile.speed>=USB_SPEED_HIGH) {
+                    int exponent=std::max(1,std::min(16,int(e->info.endpoint.bInterval)))-1;
+                    e->info.mouse_poll_interval_us=125u<<exponent;
+                } else e->info.mouse_poll_interval_us=std::max(1,int(e->info.endpoint.bInterval))*1000u;
                 if(spec.descriptor[2]&0x80) {
                     register_mouse_endpoint(&e->info,e->interface_number);
                     for(auto& i:profile.interfaces)if(i.number==e->interface_number) {

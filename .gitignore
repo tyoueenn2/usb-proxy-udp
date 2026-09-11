@@ -5,6 +5,8 @@ usb-proxy
 __pycache__/
 tests/protocol-test*
 !tests/protocol_test.cpp
+tests/click-protocol-test
+tests/telemetry-test
 *.exe
 *.pdb
 .zig-cache/

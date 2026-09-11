@@ -1,15 +1,17 @@
 import socket
 import struct
+import threading
 import unittest
-from client import MouseProxy
+from client import MouseProxy, _CLICK_REQUEST, _CLICK_ACK
 
 
 class ClientTest(unittest.TestCase):
-    def test_wire_and_button_snapshots(self):
+    def test_upx_wire_and_button_snapshots(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server:
             server.bind(('127.0.0.1', 0))
             server.settimeout(1)
-            with MouseProxy('127.0.0.1', server.getsockname()[1]) as client:
+            client = MouseProxy('127.0.0.1', server.getsockname()[1])
+            try:
                 client.sequence = 0xffffffff
                 client.move(-320, 320, -1, 1)
                 packet, peer = server.recvfrom(100)
@@ -26,7 +28,33 @@ class ClientTest(unittest.TestCase):
                 self.assertEqual(server.recv(100)[14], 0)
                 with self.assertRaises(ValueError):
                     client.button(9, True)
-            self.assertEqual(server.recv(100)[14], 0)
+            finally:
+                client.socket.close()
+
+    def test_click_retry_and_separate_counts(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server:
+            server.bind(('127.0.0.1', 0));server.settimeout(1)
+            requests = []
+            def responder():
+                for status, completed in ((1, 0), (2, 0), (3, 5)):
+                    packet, peer = server.recvfrom(100);fields = _CLICK_REQUEST.unpack(packet);requests.append(fields)
+                    ack = _CLICK_ACK.pack(b'UPA1', 1, status, fields[3], 0, fields[5], fields[6],
+                                          fields[7], completed, 77, 1, 0, 0)
+                    # Drop the first accepted ACK to force an identical same-ID retry.
+                    if status != 1:
+                        server.sendto(ack, peer)
+            thread = threading.Thread(target=responder);thread.start()
+            client = MouseProxy('127.0.0.1', server.getsockname()[1])
+            try:
+                result = client.schedule_clicks(1, 5, 8, 20, timeout=2, retry_interval=0.02)
+                self.assertEqual(result['status'], 'completed')
+                self.assertEqual(result['accepted_clicks'], 5)
+                self.assertEqual(result['completed_clicks'], 5)
+            finally:
+                client.socket.close();thread.join(1)
+            self.assertEqual(len(requests), 3)
+            self.assertEqual({request[6] for request in requests}, {1})
+            self.assertEqual({request[5] for request in requests}, {client.session})
 
 
 if __name__ == '__main__':

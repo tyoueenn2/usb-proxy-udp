@@ -100,6 +100,15 @@ struct usb_raw_transfer_io {
 	// Userspace-only metadata, outside the buffer passed to the kernel.
 	uint64_t injection_deadline_ns = 0;
 	uint64_t mouse_generation = 0;
+	uint64_t click_session = 0;
+	uint64_t click_command = 0;
+	uint32_t click_index = 0;
+	uint8_t persistent_buttons = 0;
+	uint8_t scheduled_buttons = 0;
+	uint8_t mouse_report_kind = 0;
+	uint8_t click_button = 0;
+	uint8_t click_blocked = 0;
+	uint8_t mouse_final_buttons = 0;
 };
 
 /*----------------------------------------------------------------------*/
@@ -113,6 +122,7 @@ struct thread_info {
 	std::deque<usb_raw_transfer_io> *data_queue;
 	std::mutex			*data_mutex;
 	std::condition_variable		*data_cond;
+	uint32_t			mouse_poll_interval_us;
 };
 
 struct raw_gadget_endpoint {

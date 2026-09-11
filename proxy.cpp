@@ -142,9 +142,13 @@ void *ep_loop_write(void *arg) {
 			printData(io, ep.bEndpointAddress, transfer_type, dir);
 
 		if (ep.bEndpointAddress & USB_DIR_IN) {
-			if (transfer_type == "int" && !merge_mouse_report(ep.bEndpointAddress, io))
+			if (transfer_type == "int" && !merge_mouse_report(ep.bEndpointAddress, io)) {
+				notify_mouse_report_written(ep.bEndpointAddress, io, false);
 				continue;
+			}
 			int rv = usb_raw_ep_write(fd, (struct usb_raw_ep_io *)&io);
+			if (transfer_type == "int")
+				notify_mouse_report_written(ep.bEndpointAddress, io, rv >= 0);
 			if (rv < 0 && errno == ESHUTDOWN) {
 				printf("EP%x(%s_%s): device likely reset, stopping thread\n",
 					ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
@@ -374,6 +378,13 @@ void process_eps(int fd, int config, int interface, int altsetting) {
 			ep->thread_info.dir = "out";
 
 		ep->thread_info.ep_num = usb_raw_ep_enable(fd, &ep->thread_info.endpoint);
+		if (usb_endpoint_type(&ep->endpoint) == USB_ENDPOINT_XFER_INT) {
+			int speed=libusb_get_device_speed(libusb_get_device(dev_handle));
+			if (speed>=LIBUSB_SPEED_HIGH) {
+				int exponent=std::max(1,std::min(16,int(ep->endpoint.bInterval)))-1;
+				ep->thread_info.mouse_poll_interval_us=125u<<exponent;
+			} else ep->thread_info.mouse_poll_interval_us=std::max(1,int(ep->endpoint.bInterval))*1000u;
+		}
 		if (alt->interface.bInterfaceClass == USB_CLASS_HID &&
 		    usb_endpoint_dir_in(&ep->endpoint) && usb_endpoint_type(&ep->endpoint) == USB_ENDPOINT_XFER_INT)
 			register_mouse_endpoint(&ep->thread_info, alt->interface.bInterfaceNumber);

@@ -1,6 +1,6 @@
 # USB Proxy UDP — Raspberry Pi mouse proxy and replay
 
-Forward a USB mouse through a Raspberry Pi 4, control it over Ethernet, or record its USB enumeration and emulate its HID mouse interface without the physical mouse attached.
+Forward a USB mouse through a Raspberry Pi 4, control it over Ethernet, or record its USB enumeration and emulate its HID mouse interface without the physical mouse attached. The UDP path supports persistent synthetic holds and idempotent click sequences timed on the Pi.
 
 The target PC communicates with a USB HID device through the Pi's USB device port. A separate controller sends movement and button commands to the Pi over UDP. Image capture, video transport, YOLO inference, and CUDA processing belong on the controller PC and are outside this repository.
 
@@ -58,7 +58,7 @@ sudo env USB_PROXY_PEER=192.168.1.10 ./usb-proxy \
   --enable_injection --debug_level=0
 ```
 
-Let the target PC finish enumeration, then move the physical mouse once. The proxy learns a supported report layout and becomes ready for UDP input. Physical button holds remain active when movement is injected; releasing an injected button does not release a physical hold.
+Let the target PC finish enumeration, then move the physical mouse once. The proxy learns a supported report layout and becomes ready for UDP input. Physical, persistent injected, and scheduled-click button state are tracked independently and merged with bitwise OR. A synthetic release therefore never clears a physical hold.
 
 In **live mode**, `--enable_injection` starts UDP and loads the existing `injection.json` rules. Run from the checkout or pass `--injection_file` explicitly. The supplied rules are disabled by default. Without this option, live USB forwarding and optional recording still work, but UDP control is disabled.
 
@@ -111,25 +111,32 @@ with MouseProxy('192.168.1.20') as mouse:  # Pi Ethernet IPv4 address
     mouse.button(1, True)
     mouse.move(8, 0)
     mouse.button(1, False)
+    result = mouse.schedule_clicks(button=1, count=25,
+                                   press_ms=8, interval_ms=20,
+                                   timeout=2.0)
+    print(result['accepted_clicks'], result['completed_clicks'])
 ```
 
 Movement values are **relative HID counts**, not absolute screen coordinates or guaranteed pixels. Calibrate sensitivity and acceleration in the controller. A target's offset in a 320×320 image is not automatically the correct mouse movement.
 
 UDP uses port **12345**. `USB_PROXY_BIND` optionally selects the Pi's local IPv4 address; `USB_PROXY_PEER` restricts accepted traffic to a controller IPv4 address. Keep one persistent socket: ownership is tied to the source IP and port. This is an unauthenticated LAN protocol.
 
-While holding injected buttons, send a snapshot at least every 100 ms; `mouse.move()` with no arguments sends zero movement. The client has no background heartbeat. After 250 ms without an accepted command, the proxy queues a release of injected buttons. Delivery still depends on the USB host accepting reports.
+While holding injected buttons, send a snapshot at least every 100 ms; `mouse.move()` with no arguments sends zero movement. `schedule_clicks()` retries its immutable request while waiting, which both survives lost acknowledgments and renews the lease. After 250 ms without an accepted command or retry, the proxy cancels synthetic work, invalidates queued synthetic reports, and queues a merged release while preserving physical holds.
 
 ## Commands and latency behavior
 
 - **Binary `UPX1`:** 16-byte packets containing a sequence number, X/Y movement, wheel, pan, and a complete injected button mask.
+- **Binary `UPC1` / `UPA1`:** versioned scheduled-click requests and acknowledgments with client sessions, monotonically increasing command IDs, accepted/completed counts, explicit failures, and same-ID retry safety within one Pi server epoch.
 - **ASCII:** movement, wheel, pan, button down/up, timed click, release, and state queries.
 - **MAKCU-style subset:** spellings such as `km.move(10,-5)` and `km.left(1)`. This is not full MAKCU API or V2 binary compatibility.
 - **Descriptor-driven encoding:** report IDs, packed 1–16-bit axes, and up to eight declared mouse buttons. Commands split automatically to fit the native movement range.
 - **Queue behavior:** immediate wakeups, bounded queues, direct interrupt reads, and no per-report logging by default.
-- **Fresh corrections:** consecutive unsent binary corrections with the same button state can replace each other. Physical reports and button/wheel events act as ordering barriers.
+- **Fresh corrections:** only consecutive unsent movement corrections with the same persistent button state can replace each other. Physical reports, button transitions, click edges, wheel, and pan act as ordering barriers.
+- **USB-aware scheduling:** a release is not queued until the press has completed in the USB writer. Timing respects the selected interrupt endpoint's advertised polling interval and USB backpressure.
+- **Bounded overload:** click work, command history, and USB reports use fixed limits. New work receives `queue_full` instead of disappearing, and synthetic reports are capped so physical traffic keeps service capacity.
 - **Expiry:** binary motion older than 25 ms since enqueue on the Pi is zeroed before USB submission; its button snapshot is retained. This does not measure network transit time or cancel a USB request already submitted.
 
-For packet layouts, command syntax, replies, limits, and migration from the original raw-hex UDP injector, see [USAGE.md](USAGE.md).
+The legacy `UPS1`/`UPT1` Receiver telemetry layout is preserved. `UPS2`/`UPT2` adds separate persistent/scheduled masks and accepted/completed totals while keeping physical direction and buttons physical-only. For exact packet layouts, command syntax, status codes, limits, and restart behavior, see [USAGE.md](USAGE.md).
 
 ## Compatibility and limitations
 
@@ -155,7 +162,9 @@ Actual latency depends on Ethernet, OS scheduling, USB host polling, and the Pi 
 | No UDC is listed | Check the Pi's device-mode configuration before starting either executable. |
 | UDP returns `not_ready` in live mode | Let enumeration finish, then move the physical mouse. Its descriptor and report must match a supported relative mouse layout. |
 | UDP returns `busy` | Another source IP/port owns the controller lease. Stop that sender and allow the 250 ms lease to expire. |
-| An injected hold releases by itself | Keep sending snapshots while holding buttons; the client does not send background heartbeats. |
+| An injected hold or unattended click sequence stops | Keep sending snapshots or same-ID click retries; the 250 ms controller watchdog intentionally clears synthetic state. |
+| `UPC1` returns `button_active` | The requested button is physically or persistently held, so a separate host-visible click cannot be guaranteed. |
+| `UPC1` returns `queue_full` | Wait for completion/cancellation and retry with the same command ID. Do not create a new ID for the same logical click sequence. |
 | Replay validation rejects the capture | Read the error, then capture any missing descriptors again. Unsupported interface types or configurations require live mode. |
 | Replay reports a bind/device error | Stop the live proxy or previous replay process; they cannot share the same UDC and UDP port. |
 | Large moves or wheel commands are rejected | Check the native report limits and whether the selected mouse advertises that axis. Queue capacity can also reject a command. |
@@ -164,9 +173,9 @@ For live USB troubleshooting, `--debug_level=3` prints outgoing report bytes. Re
 
 ## Validation
 
-`make test` includes HID encoding and malformed-descriptor tests, a hardware-free UDP/state integration test, capture/replay roundtrips and invalid-capture checks, and Python sender tests. The [GitHub Actions workflow](.github/workflows/build.yml) builds on Linux and includes HID parser sanitizer checks.
+`make test` includes HID encoding and malformed-descriptor tests, `UPC1`/`UPA1` and telemetry wire tests, capture/replay roundtrips, Python retry tests, and a simulated USB-writer integration test. The integration test covers physical/synthetic hold combinations, movement and edge ordering, duplicate and reordered requests, lost acknowledgments, queue recovery, timeout, layout changes, USB write failure, shutdown cleanup, and sustained simulated schedules at 10, 25, and 50 clicks per second. The [GitHub Actions workflow](.github/workflows/build.yml) builds and runs these tests on Linux.
 
-During development, the portable HID, capture/replay, and Python tests passed; the proxy sources compiled for ARM64, and the standalone replay executable linked for ARM64. These checks do not replace Pi hardware tests. Verify enumeration, button behavior, disconnect/reconnect, suspend/resume, and latency on your setup.
+The simulated click-rate checks establish scheduler correctness only. They do not establish a supported physical click rate. Measure the complete path on a Raspberry Pi 4 with its actual Raw Gadget endpoint and target USB host before publishing a hardware rate. Also verify enumeration, button behavior, disconnect/reconnect, suspend/resume, and latency on your setup.
 
 ## Documentation and credits
 
