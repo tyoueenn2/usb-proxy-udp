@@ -130,7 +130,7 @@ int main() {
     // Coalescing cannot cross persistent transitions or reorder their reports.
     f.paused=true;{std::lock_guard<std::mutex> lock(f.queue_mutex);f.queue.clear();}
     f.upx(1);f.upx(2);f.upx(3,0,1);f.upx(4,0,1);f.upx(5,0,1);f.upx(6,0,0);
-    f.upx(7);f.upx(8);
+    f.upx(7);f.upx(8);f.barrier();
     {
         std::lock_guard<std::mutex> lock(f.queue_mutex);usb_raw_transfer_io physical{};physical.inner.length=3;
         f.queue.push_back(physical);
