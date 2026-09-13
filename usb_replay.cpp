@@ -15,6 +15,7 @@ struct Endpoint {
     std::deque<usb_raw_transfer_io> queue;
     std::mutex mutex;std::condition_variable cond;
     std::thread worker;std::atomic<bool> stop{false};
+    std::atomic<bool> synthetic_pending{false};
     std::atomic<unsigned> idle{0};
     int interface_number=0;bool mouse=false;
     MouseProfile profile;
@@ -26,19 +27,21 @@ void write_endpoint(Endpoint* e) {
         {
             std::unique_lock<std::mutex> lock(e->mutex);
             unsigned idle=e->idle.load();
-            e->cond.wait_for(lock,std::chrono::milliseconds(idle?idle*4:20),[&]{return e->stop||!e->queue.empty();});
+            e->cond.wait_for(lock,std::chrono::milliseconds(idle?idle*4:20),[&]{return e->stop||!e->queue.empty()||
+                (e->mouse&&e->synthetic_pending.load(std::memory_order_acquire));});
             if(e->stop)break;
-            if(e->queue.empty()) {
+            if(e->mouse&&(!e->queue.empty()||e->synthetic_pending.load(std::memory_order_acquire))) {
+                lock.unlock();
+                if(!take_mouse_report(e->info.endpoint.bEndpointAddress,io))continue;
+            } else if(e->queue.empty()) {
                 if(!idle||!e->last.inner.length)continue;
                 io=e->last;timed=true;
             } else {io=e->queue.front();e->queue.pop_front();}
         }
         e->cond.notify_all();
-        if(!timed&&!merge_mouse_report(e->info.endpoint.bEndpointAddress,io)) {
-            notify_mouse_report_written(e->info.endpoint.bEndpointAddress,io,false);continue;
-        }
         int result=usb_raw_ep_write(e->info.fd,&io.inner);
-        if(!timed)notify_mouse_report_written(e->info.endpoint.bEndpointAddress,io,result>=0);
+        if(e->mouse&&!timed)
+            notify_mouse_report_written(e->info.endpoint.bEndpointAddress,io,result==int(io.inner.length));
         if(result<0)break;
         std::lock_guard<std::mutex> lock(e->mutex);
         e->last=io;
@@ -86,6 +89,7 @@ int main(int argc,char** argv) {
                 auto e=std::make_unique<Endpoint>();e->interface_number=spec.interface_number;
                 memcpy(&e->info.endpoint,spec.descriptor.data(),7);
                 e->info.fd=fd;e->info.data_queue=&e->queue;e->info.data_mutex=&e->mutex;e->info.data_cond=&e->cond;
+                e->info.mouse_endpoint=false;e->info.mouse_synthetic_pending=&e->synthetic_pending;
                 e->info.ep_num=usb_raw_ep_enable(fd,&e->info.endpoint);
                 if(profile.speed>=USB_SPEED_HIGH) {
                     int exponent=std::max(1,std::min(16,int(e->info.endpoint.bInterval)))-1;
@@ -112,7 +116,7 @@ int main(int argc,char** argv) {
                                 memcpy(io.data,sample->second.data(),sample->second.size());
                             if(e->profile.id)io.data[0]=e->profile.id;
                             e->profile.encode(MouseCommand{},reinterpret_cast<uint8_t*>(io.data));
-                            merge_mouse_report(spec.descriptor[2],io);
+                            seed_mouse_report(spec.descriptor[2],io);
                         }
                     }
                     if(e->mouse)e->worker=std::thread(write_endpoint,e.get());

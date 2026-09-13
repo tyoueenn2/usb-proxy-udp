@@ -13,10 +13,10 @@ endif
 .PHONY: all clean test
 all: usb-proxy usb-replay
 
-usb-proxy: usb-proxy.o host-raw-gadget.o device-libusb.o proxy.o misc.o udp_server.o usb_capture.o
+usb-proxy: usb-proxy.o host-raw-gadget.o device-libusb.o proxy.o misc.o udp_server.o mouse_mixer.o usb_capture.o
 	$(CXX) $^ $(LDFLAG) -o $@
 
-usb-replay: usb_replay.o host-raw-gadget.o udp_server.o usb_capture.o
+usb-replay: usb_replay.o host-raw-gadget.o udp_server.o mouse_mixer.o usb_capture.o
 	$(CXX) $^ -pthread -ljsoncpp -o $@
 
 %.o: %.cpp %.h
@@ -32,7 +32,9 @@ test:
 	./tests/click-protocol-test
 	$(CXX) -std=c++17 -Wall -Wextra -Werror -I. tests/telemetry_test.cpp -o tests/telemetry-test
 	./tests/telemetry-test
-	$(CXX) -std=c++17 -Wall -Wextra -I. tests/udp_test.cpp udp_server.cpp usb_capture.cpp -pthread -ljsoncpp -o tests/udp-test
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -DMOUSE_MIXER_TEST_STUBS -I. -Itests tests/mixer_test.cpp mouse_mixer.cpp -pthread -o tests/mixer-test
+	./tests/mixer-test
+	$(CXX) -std=c++17 -Wall -Wextra -I. tests/udp_test.cpp udp_server.cpp mouse_mixer.cpp usb_capture.cpp -pthread -ljsoncpp -o tests/udp-test
 	./tests/udp-test
 	$(CXX) -std=c++17 -Wall -Wextra -I. tests/replay_test.cpp usb_capture.cpp -pthread -ljsoncpp -o tests/replay-test
 	./tests/replay-test
@@ -44,4 +46,4 @@ clean:
 	-rm *.o
 	-rm usb-proxy
 	-rm -f usb-replay tests/replay-test
-	-rm -f *.d tests/protocol-test tests/click-protocol-test tests/telemetry-test tests/udp-test
+	-rm -f *.d tests/protocol-test tests/click-protocol-test tests/telemetry-test tests/mixer-test tests/udp-test

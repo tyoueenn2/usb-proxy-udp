@@ -65,9 +65,10 @@ class MouseProxy:
         if len(packet) != _CLICK_ACK.size or packet[:4] != b'UPA1':
             return None
         fields = _CLICK_ACK.unpack(packet)
-        if fields[1] != 1 or fields[4] or fields[11] or fields[12]:
+        if fields[1] not in (1, 2) or fields[4] or fields[11] or fields[12]:
             return None
         return {
+            'version': fields[1],
             'status': CLICK_STATUS.get(fields[2], f'unknown_{fields[2]}'),
             'status_code': fields[2], 'button': fields[3],
             'session': fields[5], 'command': fields[6],
@@ -79,7 +80,7 @@ class MouseProxy:
         self.command += 1
         return self.command
 
-    def _reliable_request(self, packet, command, wait_complete, timeout, retry_interval):
+    def _reliable_request(self, packet, command, wait_complete, timeout, retry_interval, protocol_version):
         deadline = time.monotonic() + timeout
         terminal = {'completed', 'cancelled', 'busy', 'queue_full',
                     'unsupported_button', 'invalid', 'button_active',
@@ -92,7 +93,8 @@ class MouseProxy:
                 self.socket.send(packet)  # same ID: retry is idempotent within this Pi epoch
                 next_send = now + retry_interval
             for i, ack in enumerate(self._acks):
-                if ack['session'] == self.session and ack['command'] == command:
+                if (ack['session'] == self.session and ack['command'] == command and
+                        ack['version'] == protocol_version):
                     self._acks.pop(i)
                     break
             else:
@@ -104,7 +106,8 @@ class MouseProxy:
                 ack = self._parse_ack(incoming)
                 if not ack:
                     continue
-                if ack['session'] != self.session or ack['command'] != command:
+                if (ack['session'] != self.session or ack['command'] != command or
+                        ack['version'] != protocol_version):
                     self._acks.append(ack)
                     continue
             if ack['status'] in ('accepted', 'duplicate'):
@@ -119,25 +122,34 @@ class MouseProxy:
         raise TimeoutError(f"no acknowledgment for click command {command}")
 
     def schedule_clicks(self, button=1, count=1, press_ms=8, interval_ms=20,
-                        wait_complete=True, timeout=5.0, retry_interval=0.05):
-        """Reliably ask the Pi to schedule clicks. interval_ms is press-to-press.
+                        wait_complete=True, timeout=5.0, retry_interval=0.05,
+                        protocol_version=1):
+        """Reliably ask the Pi to schedule clicks.
+
+        In protocol v1 interval_ms is press-to-press. In v2 it is the gap
+        from successful release completion to submission of the next press.
 
         Retries reuse the same command ID, so a lost acknowledgment does not
         schedule the sequence twice. Waiting also renews the 250 ms controller
         lease. The returned dict reports accepted and completed counts separately.
         """
+        if protocol_version not in (1, 2):
+            raise ValueError('protocol_version must be 1 or 2')
         command = self._next_command()
         packet = _CLICK_REQUEST.pack(
-            b'UPC1', 1, 1, button, 0, self.session, command, count,
+            b'UPC1', protocol_version, 1, button, 0, self.session, command, count,
             round(press_ms * 1000), round(interval_ms * 1000), 0)
-        return self._reliable_request(packet, command, wait_complete, timeout, retry_interval)
+        return self._reliable_request(packet, command, wait_complete, timeout, retry_interval, protocol_version)
 
-    def release_all(self, wait_complete=True, timeout=1.0, retry_interval=0.05):
+    def release_all(self, wait_complete=True, timeout=1.0, retry_interval=0.05,
+                    protocol_version=1):
         """Clear persistent holds, cancel scheduled clicks, and request a merged release."""
+        if protocol_version not in (1, 2):
+            raise ValueError('protocol_version must be 1 or 2')
         command = self._next_command()
         packet = _CLICK_REQUEST.pack(
-            b'UPC1', 1, 2, 0, 0, self.session, command, 0, 0, 0, 0)
-        result = self._reliable_request(packet, command, wait_complete, timeout, retry_interval)
+            b'UPC1', protocol_version, 2, 0, 0, self.session, command, 0, 0, 0, 0)
+        result = self._reliable_request(packet, command, wait_complete, timeout, retry_interval, protocol_version)
         self.buttons = 0
         return result
 

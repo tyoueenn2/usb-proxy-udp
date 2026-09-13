@@ -1,4 +1,5 @@
 #include "mouse_protocol.h"
+#include <array>
 #include <cassert>
 #include <iostream>
 #include <random>
@@ -17,6 +18,12 @@ std::vector<uint8_t> descriptor(int bits, bool report_id) {
     return d;
 }
 int main() {
+    const std::array<uint8_t,16> upx_golden={'U','P','X','1',0xff,0xff,0xff,0xff,
+        0xfe,0xc0,0x01,0x40,0xff,0x01,0x05,0};
+    assert(!std::memcmp(upx_golden.data(),"UPX1",4));
+    assert(read_be32(upx_golden.data()+4)==0xffffffffu);
+    assert(read_i16(upx_golden.data()+8)==-320&&read_i16(upx_golden.data()+10)==320);
+    assert(int8_t(upx_golden[12])==-1&&int8_t(upx_golden[13])==1&&upx_golden[14]==5&&upx_golden[15]==0);
     for(int bits:{8,12,16})for(bool id:{false,true}) {
         auto d=descriptor(bits,id);auto profiles=parse_mouse_descriptor(d.data(),d.size());
         assert(profiles.size()==1);const auto& p=profiles[0];
@@ -36,7 +43,7 @@ int main() {
         for(size_t n=0;n<d.size();++n)assert(parse_mouse_descriptor(d.data(),n).empty());
         if(id){report[0]=3;assert(!p.matches(report.data(),report.size()));}
     }
-    assert(sequence_newer(0,0xffffffff));assert(!sequence_newer(9,10));
+    assert(sequence_newer(0,0xffffffff));assert(sequence_newer(0x80000000u,1));assert(!sequence_newer(9,10));
     assert(!sequence_newer(10,10));assert(!sequence_newer(0x80000000,0));
     const uint8_t negative[]={0x80,0};assert(read_i16(negative)==-32768);
     std::mt19937 rng(1234);

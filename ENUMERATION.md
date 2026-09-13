@@ -48,6 +48,8 @@ Use your actual UDC name/driver. Replay starts the same UDP server on port 12345
 
 The host should enumerate a HID mouse with the captured identity and report format. Check the HID/mouse device and hardware IDs on the host, then send a small move using `client.py`. This recognition and movement still require verification on your Pi and target PC.
 
+Replay uses the same completion-aware synthetic mixer as live mode. It preserves the captured report ID and unknown report bytes in its template, clears relative fields for idle/`GET_REPORT` responses, and advances scheduled clicks only after successful Raw Gadget writer completion. Because replay has no physical source, its UPT3 physical counters remain zero.
+
 ## Supported simulation
 
 - Exact captured descriptor payloads, with short replies limited to the new host's requested length; strings remain keyed by language ID.

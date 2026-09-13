@@ -2,6 +2,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <deque>
+#include <atomic>
 
 #include "misc.h"
 
@@ -102,13 +103,30 @@ struct usb_raw_transfer_io {
 	uint64_t mouse_generation = 0;
 	uint64_t click_session = 0;
 	uint64_t click_command = 0;
+	uint64_t synthetic_item_id = 0;
+	uint64_t physical_queued_ns = 0;
 	uint32_t click_index = 0;
+	int32_t synthetic_x = 0;
+	int32_t synthetic_y = 0;
+	int32_t synthetic_wheel = 0;
+	int32_t synthetic_pan = 0;
+	int32_t physical_x = 0;
+	int32_t physical_y = 0;
+	int32_t physical_wheel = 0;
+	int32_t physical_pan = 0;
 	uint8_t persistent_buttons = 0;
 	uint8_t scheduled_buttons = 0;
+	uint8_t physical_buttons = 0;
 	uint8_t mouse_report_kind = 0;
 	uint8_t click_button = 0;
 	uint8_t click_blocked = 0;
 	uint8_t mouse_final_buttons = 0;
+	uint8_t mouse_managed = 0;
+	uint8_t mouse_physical = 0;
+	uint8_t mouse_physical_match = 0;
+	uint8_t mouse_standalone = 0;
+	uint8_t mouse_competing_standalone = 0;
+	uint8_t synthetic_apply_buttons = 0;
 };
 
 /*----------------------------------------------------------------------*/
@@ -123,6 +141,8 @@ struct thread_info {
 	std::mutex			*data_mutex;
 	std::condition_variable		*data_cond;
 	uint32_t			mouse_poll_interval_us;
+	bool				mouse_endpoint;
+	std::atomic<bool>		*mouse_synthetic_pending;
 };
 
 struct raw_gadget_endpoint {

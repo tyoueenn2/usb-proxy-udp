@@ -6,7 +6,7 @@ Build and start the Pi proxy as shown in [README.md](README.md). UDP listens on 
 
 Move the physical mouse once after enumeration. `+state` returns `not_ready` until a supported descriptor and matching physical report have been observed. Unsupported physical reports continue through the proxy without modification.
 
-One controller owns the endpoint for 250 ms after each accepted command, identified by source IP and UDP port. `UPC1` also binds the lease to its client session ID. Keep one socket open. Other controllers receive `busy`; telemetry and state queries do not acquire or renew ownership.
+One controller owns the endpoint for 250 ms, identified only by source IP and UDP source port. Keep one socket open. Valid UPX1 traffic, accepted UPC1 commands, and exact UPC1 retries from that endpoint renew the lease. A changed client session on the same UDP endpoint does not create a second owner. Other endpoints receive `busy`; telemetry and state queries do not acquire or renew ownership.
 
 The proxy keeps three independent button masks:
 
@@ -33,7 +33,8 @@ with MouseProxy('192.168.1.20') as mouse:
         button=1,
         count=25,
         press_ms=8,
-        interval_ms=20,        # press-to-press: requested 50 clicks/second
+        interval_ms=12,        # v2: release completion to next press
+        protocol_version=2,
         timeout=2.0,
     )
     print(result['accepted_clicks'], result['completed_clicks'])
@@ -85,7 +86,7 @@ Movement older than 25 ms since it entered the Pi queue is zeroed before USB sub
 | Offset | Bytes | Field |
 |---:|---:|---|
 | 0 | 4 | ASCII `UPC1` |
-| 4 | 1 | Protocol version, currently `1` |
+| 4 | 1 | Protocol version: `1` or `2` |
 | 5 | 1 | Operation: `1` schedule, `2` release all |
 | 6 | 1 | HID button usage 1–8; zero for release all |
 | 7 | 1 | Reserved |
@@ -93,7 +94,7 @@ Movement older than 25 ms since it entered the Pi queue is zeroed before USB sub
 | 16 | 8 | Nonzero, monotonically increasing command ID |
 | 24 | 4 | Click count |
 | 28 | 4 | Press duration in microseconds |
-| 32 | 4 | Press-to-press interval in microseconds |
+| 32 | 4 | v1 press-to-press interval; v2 release-completion-to-next-press gap, in microseconds |
 | 36 | 4 | Reserved |
 
 Python encoding:
@@ -103,13 +104,17 @@ struct.pack('!4sBBBBQQIIII', b'UPC1', 1, operation, button, 0,
             session_id, command_id, count, press_us, interval_us, 0)
 ```
 
-For operation 1, count must be 1–10,000 and the button must exist in the selected HID report. Press duration must be at least the endpoint's advertised polling interval and no more than 5 seconds. The interval must allow the press duration plus one polling interval and must be no more than 60 seconds. Timing starts from successful USB-writer completion of the press report. The release is not queued until that completion is known, so USB backpressure cannot reverse a press/release pair.
+Use version byte `2` for release-gap timing. The Python helper selects it with `protocol_version=2`.
 
-The Pi executes one click sequence at a time and keeps up to 64 accepted sequences. The shared USB report queue holds 32 reports and limits synthetic reports to 8, leaving capacity and service opportunities for physical input. If bounded capacity is unavailable, the command receives `queue_full`; accepted click edges are not silently discarded.
+For operation 1 in both versions, count must be 1–10,000 and the button must exist in the selected HID report. Press duration must be at least the endpoint's advertised polling interval and no more than 5 seconds. Timing starts only after successful USB-writer completion of the press report, and a click completes only after successful writer completion of its release.
+
+Version 1 is unchanged: the interval is press-to-press, must be at least `press_us + poll_interval_us`, and may not exceed 60 seconds. Version 2 treats the interval as a gap after successful release completion. Its range is 0 through 60 seconds. A zero v2 gap can queue the next press only after the previous release has completed, so writer ordering and destination polling still separate the edges.
+
+The Pi executes one click sequence at a time and keeps up to 64 accepted sequences. Genuine physical reports remain in their ordered 32-report FIFO. Synthetic work uses a separate eight-item overlay queue, and completion/failure feedback uses a bounded 32-event queue. If bounded capacity is unavailable, the command receives `queue_full`; accepted click edges are not silently discarded.
 
 If the requested button is physically held or persistently injected when a sequence starts, the command terminates with `button_active`. The same status is returned if a hold appears while the sequence is running and prevents a host-visible release. Completed counts include only press/release pairs whose reports both completed in the USB writer.
 
-Operation 2 is release all. Button, count, and both timing fields must be zero. It clears persistent holds, cancels queued or active click sequences, invalidates stale synthetic reports, and queues a final merged release. Physical holds remain in that report.
+Operation 2 is release all. Button, count, and both timing fields must be zero. It clears persistent holds, cancels queued or active click sequences, invalidates stale synthetic reports, and queues a final merged release. Physical holds remain in that report. If no usable endpoint can receive that report, internal state is cleared but the accepted ReleaseAll ends as `cancelled`; it is never reported as USB-completed.
 
 ## UPA1 acknowledgments
 
@@ -118,7 +123,7 @@ Every valid or recognizable `UPC1` request receives a 48-byte `UPA1` response:
 | Offset | Bytes | Field |
 |---:|---:|---|
 | 0 | 4 | ASCII `UPA1` |
-| 4 | 1 | Protocol version, currently `1` |
+| 4 | 1 | Same supported protocol version as the request: `1` or `2` |
 | 5 | 1 | Status code |
 | 6 | 1 | Button usage |
 | 7 | 1 | Reserved |
@@ -135,8 +140,8 @@ Every valid or recognizable `UPC1` request receives a 48-byte `UPA1` response:
 |---:|---|---|
 | 1 | `accepted` | Command stored exactly once in this server epoch |
 | 2 | `duplicate` | Same accepted command is still active or queued |
-| 3 | `completed` | All accepted clicks completed, or release all completed |
-| 4 | `busy` | Another controller or session owns the lease |
+| 3 | `completed` | Every accepted click release, or the ReleaseAll report, completed in the USB writer |
+| 4 | `busy` | Another source IP/UDP-port endpoint owns the lease |
 | 5 | `queue_full` | A bounded scheduler, cache, session, or report queue cannot accept work |
 | 6 | `unsupported_button` | Usage is outside 1–8 or absent from the HID descriptor |
 | 7 | `invalid` | Version, reserved bytes, operation, count, or timing is invalid |
@@ -145,21 +150,42 @@ Every valid or recognizable `UPC1` request receives a 48-byte `UPA1` response:
 | 10 | `not_ready` | No supported mouse report layout is active |
 | 11 | `stale_command` | Command ID is below the session's accepted high-water mark and no longer cached |
 
-Generate a random nonzero session ID when the client starts and increase its command ID for every new request. Retransmit the exact request after an ACK loss. A repeated `(session ID, command ID)` never schedules twice during the current Pi server epoch. Active and recent results are cached; a bounded per-session high-water mark prevents an evicted command from running again. The server accepts at most 32 distinct client sessions and caches up to 256 command records per epoch.
+Generate a random nonzero session ID when the client starts and increase its command ID for every new request. Retransmit the exact request after an ACK loss. A repeated `(session ID, command ID)` never schedules twice during the current Pi server epoch. Reusing that key with a different version, operation, button, count, or timing payload returns `invalid` without changing the original command. Active and recent results are cached; a bounded per-session high-water mark prevents an evicted command from running again. The server accepts at most 32 distinct client sessions and caches up to 256 command records per epoch.
 
-The epoch changes when the UDP server process restarts. Idempotency does not cross a restart. After observing a different epoch, create a new random session ID and reconcile application state before issuing new clicks.
+`queue_full` is transient: it creates no cache record and does not advance the session high-water mark, so the same exact ID may be retried later. An accepted ReleaseAll does advance the high-water mark; delayed lower Schedule IDs then return `stale_command` rather than recreating cancelled work.
+
+The Pi generates a random nonzero epoch whenever its UDP server starts. Idempotency does not cross a restart. After observing a different epoch, create a new random session ID and reconcile application state before issuing new clicks.
+
+The result levels have distinct meanings:
+
+- **Submitted locally:** the client sent a UDP datagram; this does not prove Pi acceptance.
+- **Accepted by Pi:** an `accepted` or active `duplicate` response proves the command was stored idempotently in this epoch.
+- **Completed by USB writer:** `completed` proves the required release write returned its full report length.
+- **Observed by the destination USB stack:** software simulation and a successful local writer call do not prove this; verify it with the actual Pi, Raw Gadget endpoint, and target host.
 
 ## Watchdog, reset, and shutdown
 
-After 250 ms without an accepted controller command or same-ID retry, the proxy releases ownership, cancels click work, clears both synthetic masks, invalidates queued synthetic reports, and queues a final merged report when an endpoint is available. The same cleanup runs for endpoint/layout generation changes, USB writer errors, release all, and shutdown. Physical state is read only from physical HID reports and is preserved while the physical endpoint remains present.
+After 250 ms without valid UPX1 traffic, an accepted controller command, or an exact same-ID retry, the proxy releases ownership, cancels click work, clears the desired synthetic masks, invalidates queued synthetic reports, and queues a final merged report when an endpoint is available. The same cleanup runs for endpoint/layout generation changes, USB writer errors, release all, and shutdown. Physical state is read only from physical HID reports and is preserved while the physical endpoint remains present.
+
+UPT2/UPT3 applied masks change only after a full successful USB write. If a layout change temporarily removes the usable report template, the release remains pending and is merged after the next matching physical report establishes the new layout. This avoids reporting a release as applied while no endpoint could receive it.
+
+## Poll-aware HID mixing
+
+The physical reader puts every received report into a bounded ordered FIFO and backpressures at 32 reports. It never intentionally coalesces physical reports. The mixer copies each physical report, including its report ID and unknown/vendor bytes, and changes only fields identified by the active HID layout.
+
+The next eligible synthetic movement, wheel, pan, or button state is fused into the oldest compatible physical report when all sums fit their native HID ranges. If any movement component would overflow, the physical movement is sent unchanged and synthetic movement stays pending. A button transition or release in the same item can still be applied while that movement waits. Synthetic state is committed only after the USB writer returns the full report length.
+
+When no compatible physical report is ready, the mixer creates a standalone report from the last successful physical template. If physical input is queued, standalone synthetic output has a burst limit of one and receives at most one of every four successful output opportunities. A physical queue depth of two or more always sends physical next. Fusion does not consume this standalone budget.
+
+The endpoint polling period comes from the forwarded descriptor: high speed uses `125 µs << (bInterval - 1)` and full/low speed uses `bInterval × 1000 µs`. Raw Gadget and destination host polling remain authoritative. Under a responsive endpoint and sustainable simulated load, the policy target is p99 physical FIFO residence within two polling periods. An unresponsive endpoint or source rate above destination capacity causes visible queue growth/backpressure and can exceed the target; the software does not claim losslessness outside sustainable load.
 
 ## Telemetry subscriptions
 
 For compatibility with the earlier Receiver telemetry patch, the `UPS1`/`UPT1` layouts remain unchanged. A subscription is a 24-byte packet:
 
-| Offset | Bytes | `UPS1` / `UPS2` field |
+| Offset | Bytes | `UPS1` / `UPS2` / `UPS3` field |
 |---:|---:|---|
-| 0 | 4 | ASCII `UPS1` for legacy telemetry or `UPS2` for extended telemetry |
+| 0 | 4 | ASCII `UPS1`, `UPS2`, or `UPS3` |
 | 4 | 4 | Reserved; must be zero |
 | 8 | 8 | Nonzero receiver session ID |
 | 16 | 8 | Increasing nonzero subscription token |
@@ -207,6 +233,43 @@ Refresh a subscription within 100 ms. Changed telemetry is sent immediately and 
 | 72 | 8 | Mouse layout generation |
 
 Physical direction and physical button fields come only from real HID reports. Injected movement and synthetic button masks never contaminate those fields.
+
+`UPT3` is exactly 128 bytes and extends telemetry without changing UPT1 or the public 80-byte UPT2:
+
+| Offset | Bytes | Field |
+|---:|---:|---|
+| 0 | 4 | ASCII `UPT3` |
+| 4 | 1 | Ready flag |
+| 5 | 1 | Physical button mask only |
+| 6 | 1 | Applied persistent injected mask |
+| 7 | 1 | Applied scheduled-click mask |
+| 8 | 8 | Receiver session ID |
+| 16 | 8 | Pi server epoch shared with UPA1 |
+| 24 | 8 | Echoed subscription token |
+| 32 | 4 | Telemetry sequence modulo 2^32 |
+| 36 | 4 | Native X minimum, signed |
+| 40 | 4 | Native X maximum, signed |
+| 44 | 4 | Native Y minimum, signed |
+| 48 | 4 | Native Y maximum, signed |
+| 52 | 4 | Destination endpoint polling interval in microseconds |
+| 56 | 8 | Mouse endpoint/layout generation |
+| 64 | 8 | Pi monotonic snapshot time in nanoseconds |
+| 72 | 8 | Cumulative physical X counts, signed |
+| 80 | 8 | Cumulative physical Y counts, signed |
+| 88 | 4 | Microseconds since last nonzero physical motion, saturated; `0xffffffff` if none |
+| 92 | 4 | Total accepted clicks this epoch, saturated |
+| 96 | 4 | Total completed clicks this epoch, saturated |
+| 100 | 2 | Active click-sequence count |
+| 102 | 2 | Queued click-sequence count |
+| 104 | 4 | Matching physical reports received, saturated |
+| 108 | 4 | Matching physical reports successfully submitted, saturated |
+| 112 | 2 | Physical endpoint/output FIFO depth, saturated |
+| 114 | 2 | Pending synthetic-item depth, saturated |
+| 116 | 4 | Superseded synthetic movement count, saturated |
+| 120 | 4 | USB writer failure count, saturated |
+| 124 | 4 | Reserved, zero |
+
+The physical mask, deltas, cumulative counts, and physical report counters are captured before UDP overlays are applied. A fused output increments the successfully submitted physical count once. The UDP thread takes snapshots and sends telemetry; the USB writer performs no network I/O.
 
 ## ASCII compatibility
 

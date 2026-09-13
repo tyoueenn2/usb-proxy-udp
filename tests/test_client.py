@@ -56,6 +56,38 @@ class ClientTest(unittest.TestCase):
             self.assertEqual({request[6] for request in requests}, {1})
             self.assertEqual({request[5] for request in requests}, {client.session})
 
+    def test_v2_release_gap_request_and_ack_version(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server:
+            server.bind(('127.0.0.1', 0));server.settimeout(1)
+            captured = []
+            def responder():
+                packet, peer = server.recvfrom(100);fields = _CLICK_REQUEST.unpack(packet);captured.append(fields)
+                for status, completed in ((1, 0), (3, 2)):
+                    ack = _CLICK_ACK.pack(b'UPA1', fields[1], status, fields[3], 0, fields[5], fields[6],
+                                          fields[7], completed, 88, 0, 0, 0)
+                    server.sendto(ack, peer)
+            thread = threading.Thread(target=responder);thread.start()
+            client = MouseProxy('127.0.0.1', server.getsockname()[1])
+            try:
+                result = client.schedule_clicks(2, 2, 1, 0, protocol_version=2, timeout=1)
+                self.assertEqual(result['version'], 2)
+                self.assertEqual(result['completed_clicks'], 2)
+            finally:
+                client.socket.close();thread.join(1)
+            fields = captured[0]
+            self.assertEqual(fields[1:4], (2, 1, 2))
+            self.assertEqual(fields[7:11], (2, 1000, 0, 0))
+
+    def test_rejects_unsupported_click_version(self):
+        client = MouseProxy('127.0.0.1', 9)
+        try:
+            with self.assertRaises(ValueError):
+                client.schedule_clicks(protocol_version=3)
+            with self.assertRaises(ValueError):
+                client.release_all(protocol_version=0)
+        finally:
+            client.socket.close()
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -112,7 +112,8 @@ with MouseProxy('192.168.1.20') as mouse:  # Pi Ethernet IPv4 address
     mouse.move(8, 0)
     mouse.button(1, False)
     result = mouse.schedule_clicks(button=1, count=25,
-                                   press_ms=8, interval_ms=20,
+                                   press_ms=8, interval_ms=12,
+                                   protocol_version=2,
                                    timeout=2.0)
     print(result['accepted_clicks'], result['completed_clicks'])
 ```
@@ -121,22 +122,22 @@ Movement values are **relative HID counts**, not absolute screen coordinates or 
 
 UDP uses port **12345**. `USB_PROXY_BIND` optionally selects the Pi's local IPv4 address; `USB_PROXY_PEER` restricts accepted traffic to a controller IPv4 address. Keep one persistent socket: ownership is tied to the source IP and port. This is an unauthenticated LAN protocol.
 
-While holding injected buttons, send a snapshot at least every 100 ms; `mouse.move()` with no arguments sends zero movement. `schedule_clicks()` retries its immutable request while waiting, which both survives lost acknowledgments and renews the lease. After 250 ms without an accepted command or retry, the proxy cancels synthetic work, invalidates queued synthetic reports, and queues a merged release while preserving physical holds.
+While holding injected buttons, send a snapshot at least every 100 ms; `mouse.move()` with no arguments sends zero movement. `schedule_clicks()` retries its immutable request while waiting, which both survives lost acknowledgments and renews the lease. After 250 ms without valid UPX1 traffic, an accepted command, or an exact retry, the proxy cancels synthetic work, invalidates queued synthetic reports, and queues a merged release while preserving physical holds.
 
 ## Commands and latency behavior
 
 - **Binary `UPX1`:** 16-byte packets containing a sequence number, X/Y movement, wheel, pan, and a complete injected button mask.
-- **Binary `UPC1` / `UPA1`:** versioned scheduled-click requests and acknowledgments with client sessions, monotonically increasing command IDs, accepted/completed counts, explicit failures, and same-ID retry safety within one Pi server epoch.
+- **Binary `UPC1` / `UPA1`:** v1 keeps its press-to-press timing; v2 measures the gap from a successful release completion to the next press. Both provide idempotent command IDs, separate accepted/completed counts, and explicit failures.
 - **ASCII:** movement, wheel, pan, button down/up, timed click, release, and state queries.
 - **MAKCU-style subset:** spellings such as `km.move(10,-5)` and `km.left(1)`. This is not full MAKCU API or V2 binary compatibility.
 - **Descriptor-driven encoding:** report IDs, packed 1–16-bit axes, and up to eight declared mouse buttons. Commands split automatically to fit the native movement range.
-- **Queue behavior:** immediate wakeups, bounded queues, direct interrupt reads, and no per-report logging by default.
+- **Physical-first mixing:** genuine reports stay in a bounded ordered FIFO. Synthetic work uses a separate eight-item overlay queue and is fused into a compatible physical report when every affected field fits. Report IDs and unknown bytes are preserved.
 - **Fresh corrections:** only consecutive unsent movement corrections with the same persistent button state can replace each other. Physical reports, button transitions, click edges, wheel, and pan act as ordering barriers.
 - **USB-aware scheduling:** a release is not queued until the press has completed in the USB writer. Timing respects the selected interrupt endpoint's advertised polling interval and USB backpressure.
-- **Bounded overload:** click work, command history, and USB reports use fixed limits. New work receives `queue_full` instead of disappearing, and synthetic reports are capped so physical traffic keeps service capacity.
+- **Bounded overload:** click work, command history, physical reports, synthetic overlays, and writer events use fixed limits. New work receives `queue_full` instead of disappearing. With physical traffic queued, standalone synthetic reports receive at most one in four successful output opportunities and never go ahead of a physical depth of two or more.
 - **Expiry:** binary motion older than 25 ms since enqueue on the Pi is zeroed before USB submission; its button snapshot is retained. This does not measure network transit time or cancel a USB request already submitted.
 
-The legacy `UPS1`/`UPT1` Receiver telemetry layout is preserved. `UPS2`/`UPT2` adds separate persistent/scheduled masks and accepted/completed totals while keeping physical direction and buttons physical-only. For exact packet layouts, command syntax, status codes, limits, and restart behavior, see [USAGE.md](USAGE.md).
+The legacy `UPS1`/`UPT1` and public 80-byte `UPS2`/`UPT2` layouts are preserved. `UPS3`/`UPT3` adds the poll interval, physical-only cumulative motion and report counters, queue depths, movement supersession, writer failures, and a monotonic snapshot time. For exact packet layouts, command syntax, status codes, limits, and restart behavior, see [USAGE.md](USAGE.md).
 
 ## Compatibility and limitations
 
@@ -152,7 +153,7 @@ The legacy `UPS1`/`UPT1` Receiver telemetry layout is preserved. `UPS2`/`UPT2` a
 
 Unsupported replay requests stall. Use the live proxy when the host needs the physical device's proprietary behavior. Replay presents a captured HID mouse identity and layout, but is not guaranteed to be indistinguishable from the original hardware. Host recognition must be verified on the actual Pi and target PC.
 
-Actual latency depends on Ethernet, OS scheduling, USB host polling, and the Pi controller. No measured end-to-end latency is claimed, and advertised polling intervals are not modified. Low-speed physical mice are presented at full speed because dwc2 does not support low-speed gadget operation.
+Actual latency depends on Ethernet, OS scheduling, USB host polling, and the Pi controller. The mixer derives high-speed polling as `125 µs << (bInterval - 1)` and full/low-speed polling as `bInterval × 1000 µs`; it does not replace the descriptor with a fixed timer. Under responsive, sustainable simulated load, the policy target is p99 physical queue residence within two polling periods. An unresponsive endpoint or input rate above destination capacity can still apply backpressure and exceed that target. Low-speed physical mice are presented at full speed because dwc2 does not support low-speed gadget operation.
 
 ## Troubleshooting
 
@@ -173,9 +174,11 @@ For live USB troubleshooting, `--debug_level=3` prints outgoing report bytes. Re
 
 ## Validation
 
-`make test` includes HID encoding and malformed-descriptor tests, `UPC1`/`UPA1` and telemetry wire tests, capture/replay roundtrips, Python retry tests, and a simulated USB-writer integration test. The integration test covers physical/synthetic hold combinations, movement and edge ordering, duplicate and reordered requests, lost acknowledgments, queue recovery, timeout, layout changes, USB write failure, shutdown cleanup, and sustained simulated schedules at 10, 25, and 50 clicks per second. The [GitHub Actions workflow](.github/workflows/build.yml) builds and runs these tests on Linux.
+`make test` includes HID encoding and malformed-descriptor tests, golden vectors for all UDP protocol versions, capture/replay roundtrips, Python retry tests, a deterministic mixer simulation, and a simulated USB-writer integration test. The mixer test covers ordered physical reports, report IDs and unknown bytes, fusion, overflow retention, independent masks, failed writes, bounded queues/events, fake 125/1000/8000 Hz cadences, the standalone cap, and the two-poll residence target. The integration test covers all acknowledgment states, exact and conflicting duplicates, lost responses, transient queue recovery, v2 completion-gated timing, watchdog, layout changes, USB write failure, shutdown cleanup, and simulated 10, 25, and 50 clicks per second. The [GitHub Actions workflow](.github/workflows/build.yml) builds and runs these tests on Linux.
 
-The simulated click-rate checks establish scheduler correctness only. They do not establish a supported physical click rate. Measure the complete path on a Raspberry Pi 4 with its actual Raw Gadget endpoint and target USB host before publishing a hardware rate. Also verify enumeration, button behavior, disconnect/reconnect, suspend/resume, and latency on your setup.
+The client can say a request was **submitted locally** when its datagram was sent. `accepted` means the Pi stored the command idempotently. `completed` means the required release completed successfully in the Pi's USB writer. Simulation does not prove that the destination USB stack observed an edge.
+
+The simulated click-rate checks establish scheduler correctness only. They do not establish a supported physical click rate or physical-report reliability. Measure the complete path on a Raspberry Pi 4 with its actual Raw Gadget endpoint and target USB host before publishing a hardware rate. Also verify enumeration, button behavior, disconnect/reconnect, suspend/resume, and latency on your setup.
 
 ## Documentation and credits
 

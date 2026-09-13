@@ -1,15 +1,8 @@
 #pragma once
+#include "mouse_mixer.h"
 #include <atomic>
 #include <thread>
 #include <cstdint>
-struct thread_info;
-struct usb_raw_transfer_io;
-void register_mouse_endpoint(thread_info* info, int interface_number);
-void learn_mouse_descriptor(int interface_number, const uint8_t* data, unsigned length);
-void set_mouse_protocol(int interface_number, bool boot);
-void unregister_mouse_endpoint(thread_info* info);
-bool merge_mouse_report(uint8_t endpoint, usb_raw_transfer_io& io);
-void notify_mouse_report_written(uint8_t endpoint, const usb_raw_transfer_io& io, bool success);
 class UdpServer {
 public:
     explicit UdpServer(int port) : port(port) {}

@@ -112,6 +112,8 @@ void *ep_loop_write(void *arg) {
 	std::string dir = thread_info.dir;
 	std::deque<usb_raw_transfer_io> *data_queue = thread_info.data_queue;
 	std::mutex *data_mutex = thread_info.data_mutex;
+	const bool managed_mouse = thread_info.mouse_endpoint && transfer_type == "int" &&
+		(ep.bEndpointAddress & USB_DIR_IN);
 
 	printf("Start writing thread for EP%02x, thread id(%d)\n",
 		ep.bEndpointAddress, gettid());
@@ -126,29 +128,29 @@ void *ep_loop_write(void *arg) {
 		std::unique_lock<std::mutex> lock(*data_mutex);
 		// Producers notify immediately; timeout only observes shutdown from a signal.
 		thread_info.data_cond->wait_for(lock, std::chrono::milliseconds(20),
-			[&]{ return data_queue->size() > 0 || please_stop_eps; });
+			[&]{ return data_queue->size() > 0 ||
+				(managed_mouse && thread_info.mouse_synthetic_pending &&
+				 thread_info.mouse_synthetic_pending->load(std::memory_order_acquire)) || please_stop_eps; });
 
-		if (data_queue->size() == 0) {
+		struct usb_raw_transfer_io io{};
+		if (managed_mouse) {
 			lock.unlock();
-			continue;
+			if (!take_mouse_report(ep.bEndpointAddress, io)) continue;
+		} else {
+			if (data_queue->empty()) { lock.unlock(); continue; }
+			io = data_queue->front();
+			data_queue->pop_front();
+			lock.unlock();
+			thread_info.data_cond->notify_all();
 		}
-
-		struct usb_raw_transfer_io io = data_queue->front();
-		data_queue->pop_front();
-		lock.unlock();
-		thread_info.data_cond->notify_all();
 
 		if (verbose_level >= 2)
 			printData(io, ep.bEndpointAddress, transfer_type, dir);
 
 		if (ep.bEndpointAddress & USB_DIR_IN) {
-			if (transfer_type == "int" && !merge_mouse_report(ep.bEndpointAddress, io)) {
-				notify_mouse_report_written(ep.bEndpointAddress, io, false);
-				continue;
-			}
 			int rv = usb_raw_ep_write(fd, (struct usb_raw_ep_io *)&io);
-			if (transfer_type == "int")
-				notify_mouse_report_written(ep.bEndpointAddress, io, rv >= 0);
+			if (managed_mouse)
+				notify_mouse_report_written(ep.bEndpointAddress, io, rv == int(io.inner.length));
 			if (rv < 0 && errno == ESHUTDOWN) {
 				printf("EP%x(%s_%s): device likely reset, stopping thread\n",
 					ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());
@@ -253,9 +255,11 @@ void *ep_loop_read(void *arg) {
 				io.inner.ep = ep_num;
 				io.inner.flags = 0;
 				io.inner.length = nbytes;
-
 				if (injection_enabled)
 					injection(io, ep, transfer_type);
+
+				if (thread_info.mouse_endpoint && transfer_type == "int")
+					queue_physical_mouse_report(ep.bEndpointAddress, io);
 
 				std::unique_lock<std::mutex> lock(*data_mutex);
 				while (data_queue->size() >= 32 && !please_stop_eps)
@@ -356,6 +360,9 @@ void process_eps(int fd, int config, int interface, int altsetting) {
 		ep->thread_info.data_queue = new std::deque<usb_raw_transfer_io>;
 		ep->thread_info.data_mutex = new std::mutex;
 		ep->thread_info.data_cond = new std::condition_variable;
+		ep->thread_info.mouse_endpoint = false;
+		ep->thread_info.mouse_synthetic_pending = new std::atomic<bool>(false);
+		ep->thread_info.mouse_poll_interval_us = 0;
 
 		switch (usb_endpoint_type(&ep->endpoint)) {
 		case USB_ENDPOINT_XFER_ISOC:
@@ -444,6 +451,8 @@ void terminate_eps(int fd, int config, int interface, int altsetting) {
 		delete ep->thread_info.data_queue;
 		delete ep->thread_info.data_mutex;
 		delete ep->thread_info.data_cond;
+		delete ep->thread_info.mouse_synthetic_pending;
+		ep->thread_info.mouse_synthetic_pending = nullptr;
 	}
 
 	please_stop_eps = false;
