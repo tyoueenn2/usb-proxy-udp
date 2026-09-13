@@ -1,194 +1,77 @@
-# USB Proxy UDP — Raspberry Pi mouse proxy and replay
+# USB Proxy UDP
 
-Forward a USB mouse through a Raspberry Pi 4, control it over Ethernet, or record its USB enumeration and emulate its HID mouse interface without the physical mouse attached. The UDP path supports persistent synthetic holds and idempotent click sequences timed on the Pi.
+A low-latency Raspberry Pi 4 USB mouse proxy with UDP movement, persistent synthetic holds, reliable Pi-scheduled clicks, and descriptor-based HID report translation.
 
-The target PC communicates with a USB HID device through the Pi's USB device port. A separate controller sends movement and button commands to the Pi over UDP. Image capture, video transport, YOLO inference, and CUDA processing belong on the controller PC and are outside this repository.
-
-## Operating modes
-
-| Mode | Executable / option | Physical mouse required? |
-|---|---|---|
-| Live proxy | `usb-proxy --enable_injection` | Yes; physical input and UDP input are combined |
-| Enumeration recording | `usb-proxy --record_usb=mouse.jsonl` | Yes, while recording |
-| Standalone HID replay | `usb-replay mouse.jsonl UDC_NAME UDC_DRIVER` | No, once a supported capture exists |
-
-The live proxy forwards the mouse's descriptors and control traffic. Standalone replay serves captured descriptors and generates new mouse reports from UDP commands. It responds to the current host's enumeration requests; it does not play back an old sequence of movements.
-
-**Start here:** [Build](#build-on-the-pi) · [Live proxy](#quick-start-live-mouse-plus-udp) · [Record and replay](#record-enumeration-then-replay-without-the-mouse) · [Python control](#send-mouse-commands-from-python) · [Troubleshooting](#troubleshooting)
-
-## Hardware layout
+The Pi appears to the target PC as a USB HID mouse. It can merge a real mouse with UDP commands, record a device's USB enumeration, or replay a captured HID identity without the physical mouse attached. Video transport, object detection, and CUDA processing run on the controller and are outside this repository.
 
 ```text
-Physical mouse / USB receiver ──USB──> Pi 4 USB host port
-                                           │
-Controller PC ──Ethernet / UDP──────────────>│
-                                           │
-Target PC <────USB data cable────── Pi 4 USB-C device port
+Physical mouse ──USB──> Raspberry Pi 4 ──USB gadget──> Target PC
+Controller PC ──UDP───────────┘
 ```
 
-The controller and target may be the same PC. The physical mouse is optional during standalone replay. Use a USB data cable and provide adequate power for the Pi.
+## Features
 
-## Build on the Pi
+- Live physical mouse passthrough with descriptor-driven report translation.
+- Independent physical, persistent injected, and scheduled-click button state:
+  `final_buttons = physical_buttons | persistent_injected_buttons | scheduled_click_buttons`.
+- Physical holds cannot be cleared by synthetic releases.
+- Ordered physical reports and button edges, with coalescing limited to compatible movement corrections.
+- Idempotent scheduled clicks timed on the Pi and completed through the USB writer.
+- Bounded queues, explicit overload responses, USB backpressure handling, and a 250 ms controller watchdog.
+- Enumeration capture and standalone HID mouse replay.
+- Physical-only direction and motion telemetry.
 
-The Pi needs `dwc2` device mode and a kernel with Raw Gadget support. Enable the `dwc2` overlay in your Pi's boot configuration, reboot, and load the `raw_gadget` module. If your kernel does not provide it, follow the [Raw Gadget build instructions](https://github.com/xairy/raw-gadget) for your installed kernel.
+## Modes
+
+| Mode | Command | Physical mouse |
+|---|---|---|
+| Live proxy | `usb-proxy --enable_injection` | Required |
+| Enumeration recording | `usb-proxy --record_usb=mouse.jsonl` | Required while recording |
+| Standalone replay | `usb-replay mouse.jsonl UDC_NAME UDC_DRIVER` | Not required after capture |
+
+## Protocols
+
+UDP listens on port **12345**.
+
+| Protocol | Purpose |
+|---|---|
+| `UPX1` | Stable 16-byte movement packet with wheel, pan, and the complete persistent injected-button mask |
+| `UPC1` / `UPA1` | Versioned, idempotent click scheduling and acknowledgments with accepted and completed counts |
+| `UPS3` / `UPT3` | Primary request/telemetry pair, including queue, writer, scheduler, and physical-only motion state |
+| `UPS2` / `UPT2` | Canonical compatibility telemetry format |
+| ASCII | Movement, buttons, clicks, release-all, and state commands, including a MAKCU-style subset |
+
+Exact layouts, status codes, limits, retry behavior, and Python examples are in [USAGE.md](USAGE.md). Existing `UPX1` packets and ASCII commands remain supported.
+
+## Quick start
+
+The Pi requires `dwc2` device mode, Raw Gadget support, a USB data connection to the target, and the exact UDC and physical mouse VID/PID values.
 
 ```sh
 sudo apt-get install git build-essential libusb-1.0-0-dev libjsoncpp-dev python3
-git clone https://github.com/tyoueenn2/usb-proxy-udp.git
-cd usb-proxy-udp
 make -j4
 make test
 
-# Verify the gadget interface and find your exact mouse / receiver IDs:
-ls /dev/raw-gadget
-ls /sys/class/udc/
-lsusb
-# Replace VID:PID with the value from lsusb:
-sudo lsusb -v -d VID:PID
-```
-
-`make` builds **both `usb-proxy` and `usb-replay`**. The commands below use `fe980000.usb` as the example UDC name and driver; check these against your Pi. The example VID/PID `046d:c539` is not a universal G Pro identifier. Logitech receivers and wired/wireless modes can enumerate differently, so copy the IDs reported by `lsusb` for the exact mode being proxied and save its verbose descriptor output with the test record.
-
-## Quick start: live mouse plus UDP
-
-Replace `192.168.1.10` with the controller PC's IPv4 address:
-
-```sh
-sudo env USB_PROXY_PEER=192.168.1.10 ./usb-proxy \
-  --device=fe980000.usb --driver=fe980000.usb \
-  --vendor_id=046d --product_id=c539 \
+sudo env USB_PROXY_PEER=CONTROLLER_IP ./usb-proxy \
+  --device=UDC_NAME --driver=UDC_DRIVER \
+  --vendor_id=VID --product_id=PID \
   --enable_injection --debug_level=0
 ```
 
-Let the target PC finish enumeration, then move the physical mouse once. The proxy learns a supported report layout and becomes ready for UDP input. Physical, persistent injected, and scheduled-click button state are tracked independently and merged with bitwise OR. A synthetic release therefore never clears a physical hold.
+Follow [DEPLOYMENT.md](DEPLOYMENT.md) for Pi configuration, device discovery, startup, shutdown, validation, and troubleshooting.
 
-On a normal stop, first send ReleaseAll and wait for its `completed` acknowledgment, then press Ctrl+C once. This gives the final merged release a confirmed USB-writer completion before endpoint teardown. After a mouse, receiver, target cable, or report-protocol change, allow enumeration to finish and move the physical mouse again so the new descriptor-defined layout and report template become ready.
+## Scope
 
-In **live mode**, `--enable_injection` starts UDP and loads the existing `injection.json` rules. Run from the checkout or pass `--injection_file` explicitly. The supplied rules are disabled by default. Without this option, live USB forwarding and optional recording still work, but UDP control is disabled.
+- Live translation supports standard relative HID mouse layouts, boot protocol, packed 1–16-bit axes, and up to eight declared buttons.
+- Replay supports one HID-only configuration, alternate setting zero, and one interrupt IN endpoint per supported mouse interface.
+- Replay does not emulate Logitech HID++, feature reports, firmware operations, keyboard input, or proprietary output effects. Use live mode when the host requires these behaviors.
+- Simulated 10, 25, and 50 clicks-per-second tests verify scheduler logic only. A supported physical rate must be measured on a Raspberry Pi 4 with the actual USB hardware and target PC.
 
-## Record enumeration, then replay without the mouse
+## Documentation
 
-### 1. Record the real mouse
-
-```sh
-sudo ./usb-proxy \
-  --device=fe980000.usb --driver=fe980000.usb \
-  --vendor_id=046d --product_id=c539 \
-  --record_usb=mouse.jsonl
-```
-
-Wait for enumeration to finish, move the mouse once, then stop with Ctrl+C. Use a new capture filename; existing files are not overwritten. Recording and UDP injection can also be enabled together.
-
-The capture stores timestamped USB events, control SETUP requests, ACK/STALL results, descriptor response bytes, and initial supported mouse reports. Identity strings and HID report descriptors are captured when the host requests them. This is not a continuous movement recording. The older `--descriptor_file` JSON summary cannot be used as a replay profile.
-
-### 2. Check the capture
-
-```sh
-./usb-replay mouse.jsonl --check
-```
-
-This validates the capture without opening the gadget or starting UDP. Missing or truncated descriptors must be captured again.
-
-### 3. Start standalone replay
-
-Stop the live proxy first. You can now disconnect the physical mouse:
-
-```sh
-sudo env USB_PROXY_PEER=192.168.1.10 \
-  ./usb-replay mouse.jsonl fe980000.usb fe980000.usb
-```
-
-**Replay starts UDP automatically.** Once the host configures the device, its mouse state starts with released buttons and zero movement. No physical mouse movement is needed to initialize replay.
-
-See [ENUMERATION.md](ENUMERATION.md) for the capture format, supported control requests, and replay restrictions.
-
-## Send mouse commands from Python
-
-Copy [client.py](client.py) to the controller PC. It uses the Python standard library:
-
-```python
-from client import MouseProxy
-
-with MouseProxy('192.168.1.20') as mouse:  # Pi Ethernet IPv4 address
-    print(mouse.state())
-    mouse.move(12, -6)
-    mouse.button(1, True)
-    mouse.move(8, 0)
-    mouse.button(1, False)
-    result = mouse.schedule_clicks(button=1, count=25,
-                                   press_ms=8, interval_ms=12,
-                                   protocol_version=2,
-                                   timeout=2.0)
-    print(result['accepted_clicks'], result['completed_clicks'])
-```
-
-Movement values are **relative HID counts**, not absolute screen coordinates or guaranteed pixels. Calibrate sensitivity and acceleration in the controller. A target's offset in a 320×320 image is not automatically the correct mouse movement.
-
-UDP uses port **12345**. `USB_PROXY_BIND` optionally selects the Pi's local IPv4 address; `USB_PROXY_PEER` restricts accepted traffic to a controller IPv4 address. Keep one persistent socket: ownership is tied to the source IP and port. This is an unauthenticated LAN protocol.
-
-While holding injected buttons, send a snapshot at least every 100 ms; `mouse.move()` with no arguments sends zero movement. `schedule_clicks()` retries its immutable request while waiting, which both survives lost acknowledgments and renews the lease. After 250 ms without valid UPX1 traffic, an accepted command, or an exact retry, the proxy cancels synthetic work, invalidates queued synthetic reports, and queues a merged release while preserving physical holds.
-
-## Commands and latency behavior
-
-- **Binary `UPX1`:** 16-byte packets containing a sequence number, X/Y movement, wheel, pan, and a complete injected button mask.
-- **Binary `UPC1` / `UPA1`:** v1 keeps its press-to-press timing; v2 measures the gap from a successful release completion to the next press. Both provide idempotent command IDs, separate accepted/completed counts, and explicit failures.
-- **ASCII:** movement, wheel, pan, button down/up, timed click, release, and state queries.
-- **MAKCU-style subset:** spellings such as `km.move(10,-5)` and `km.left(1)`. This is not full MAKCU API or V2 binary compatibility.
-- **Descriptor-driven encoding:** report IDs, packed 1–16-bit axes, and up to eight declared mouse buttons. Commands split automatically to fit the native movement range.
-- **Physical-first mixing:** genuine reports stay in a bounded ordered FIFO. Synthetic work uses a separate eight-item overlay queue and is fused into a compatible physical report when every affected field fits. Report IDs and unknown bytes are preserved.
-- **Fresh corrections:** only consecutive unsent movement corrections with the same persistent button state can replace each other. Physical reports, button transitions, click edges, wheel, and pan act as ordering barriers.
-- **USB-aware scheduling:** a release is not queued until the press has completed in the USB writer. Timing respects the selected interrupt endpoint's advertised polling interval and USB backpressure.
-- **Bounded overload:** click work, command history, physical reports, synthetic overlays, and writer events use fixed limits. New work receives `queue_full` instead of disappearing. With physical traffic queued, standalone synthetic reports receive at most one in four successful output opportunities and never go ahead of a physical depth of two or more.
-- **Receiver restarts:** 32 active session high-water marks rotate through a bounded retired-session tombstone set, so successive Receiver sessions do not permanently exhaust the server. Retired replay protection lasts 10 minutes and is bounded to 256 sessions; exact command results use a separate 256-record cache.
-- **Recoverable release:** an accepted ReleaseAll remains pending through temporary endpoint loss, layout replacement, watchdog cleanup, and USB-writer failure. It reports `completed` only after the complete merged release succeeds in the writer; a higher command ID can explicitly replace an older pending release.
-- **Expiry:** binary motion older than 25 ms since enqueue on the Pi is zeroed before USB submission; its button snapshot is retained. This does not measure network transit time or cancel a USB request already submitted.
-
-Use `UPS3`/`UPT3` as the primary telemetry protocol. `UPT3` remains the exact 128-byte layout with poll interval, separate synthetic masks, physical-only cumulative motion and report counters, queue depths, movement supersession, writer failures, and monotonic snapshot time. The canonical 80-byte `UPT2` Receiver fallback keeps UPT1-compatible bytes 0–55, generation at 56, sample time at 64, signed physical dx/dy at 72/74, and physical-motion age at 76. For exact packet layouts, command syntax, status codes, limits, and restart behavior, see [USAGE.md](USAGE.md).
-
-## Compatibility and limitations
-
-| Area | Current scope |
-|---|---|
-| Live mouse translation | Standard relative HID mouse layouts; boot mouse protocol supported |
-| Logitech G Pro | Descriptor-driven, with no assumed packet offsets; hardware validation still required |
-| Replay configuration | One HID-only configuration, alternate setting zero, interrupt endpoints |
-| Replay mouse interface | One interrupt IN endpoint per supported mouse interface |
-| HID state in replay | Configuration/reset handling, input `GET_REPORT`, idle reports, and mouse boot/report protocol switching |
-| Proprietary behavior | Logitech HID++, feature reports, firmware operations, and vendor-specific effects are not simulated |
-| Additional replay interfaces | HID interfaces remain enumerated; keyboard input and proprietary output effects are not generated |
-
-Unsupported replay requests stall. Use the live proxy when the host needs the physical device's proprietary behavior. Replay presents a captured HID mouse identity and layout, but is not guaranteed to be indistinguishable from the original hardware. Host recognition must be verified on the actual Pi and target PC.
-
-Actual latency depends on Ethernet, OS scheduling, USB host polling, and the Pi controller. The mixer derives high-speed polling as `125 µs << (bInterval - 1)` and full/low-speed polling as `bInterval × 1000 µs`; it does not replace the descriptor with a fixed timer. Under responsive, sustainable simulated load, the policy target is p99 physical queue residence within two polling periods. An unresponsive endpoint or input rate above destination capacity can still apply backpressure and exceed that target. Low-speed physical mice are presented at full speed because dwc2 does not support low-speed gadget operation.
-
-## Troubleshooting
-
-| Symptom | What to check |
-|---|---|
-| `/dev/raw-gadget` is missing | Confirm Raw Gadget is built for the running kernel and its module is loaded. |
-| No UDC is listed | Check the Pi's device-mode configuration before starting either executable. |
-| UDP returns `not_ready` in live mode | Let enumeration finish, then move the physical mouse. Its descriptor and report must match a supported relative mouse layout. |
-| UDP returns `busy` | Another source IP/port owns the controller lease. Stop that sender and allow the 250 ms lease to expire. |
-| An injected hold or unattended click sequence stops | Keep sending snapshots or same-ID click retries; the 250 ms controller watchdog intentionally clears synthetic state. |
-| `UPC1` returns `button_active` | The requested button is physically or persistently held, so a separate host-visible click cannot be guaranteed. |
-| `UPC1` returns `queue_full` | Wait for completion/cancellation and retry with the same command ID. Do not create a new ID for the same logical click sequence. |
-| Replay validation rejects the capture | Read the error, then capture any missing descriptors again. Unsupported interface types or configurations require live mode. |
-| Replay reports a bind/device error | Stop the live proxy or previous replay process; they cannot share the same UDC and UDP port. |
-| Large moves or wheel commands are rejected | Check the native report limits and whether the selected mouse advertises that axis. Queue capacity can also reject a command. |
-
-For live USB troubleshooting, `--debug_level=3` prints outgoing report bytes. Return to `--debug_level=0` for latency measurements.
-
-## Validation
-
-`make test` includes HID encoding and malformed-descriptor tests, golden vectors for all UDP protocol versions, capture/replay roundtrips, Python retry tests, a deterministic mixer simulation, a bounded session-lifecycle test, and a simulated USB-writer integration test. The mixer test covers ordered physical reports, queued and in-flight physical completion across synthetic resets and real layout changes, report IDs and unknown bytes, fusion, overflow retention, independent masks, failed writes, bounded queues/events, fake 125/1000/8000 Hz cadences, the standalone cap, and the two-poll residence target. The integration test covers all acknowledgment states, pre- and post-acceptance `button_active` counts, exact and conflicting duplicates, lost responses, recoverable ReleaseAll, more than 32 Receiver sessions, retired delayed commands, source-port changes, release admission under session pressure, transient queue recovery, v2 completion-gated timing, watchdog, layout changes, USB write failure, shutdown cleanup, and simulated 10, 25, and 50 clicks per second. The [GitHub Actions workflow](.github/workflows/build.yml) builds and runs these tests on Linux.
-
-The client can say a request was **submitted locally** when its datagram was sent. `accepted` means the Pi stored the command idempotently. `completed` means the required release completed successfully in the Pi's USB writer. Simulation does not prove that the destination USB stack observed an edge.
-
-The simulated click-rate checks establish scheduler correctness only. They do not establish a supported physical click rate or physical-report reliability. Follow the [Raspberry Pi 4 hardware validation procedure](USAGE.md#raspberry-pi-4-hardware-validation) before publishing a hardware rate or claiming support for the G Pro Wireless or another gaming mouse.
-
-## Documentation and credits
-
+- [Deployment and operation](DEPLOYMENT.md)
 - [UDP protocol and Python client](USAGE.md)
 - [Enumeration recording and replay](ENUMERATION.md)
-- Upstream projects: [AristoChen/usb-proxy](https://github.com/AristoChen/usb-proxy) and [xairy/raw-gadget](https://github.com/xairy/raw-gadget)
-- [Original license](LICENSE) retained.
+- [GitHub Actions build and tests](.github/workflows/build.yml)
+
+Based on [AristoChen/usb-proxy](https://github.com/AristoChen/usb-proxy) and [xairy/raw-gadget](https://github.com/xairy/raw-gadget). The [original license](LICENSE) is retained.

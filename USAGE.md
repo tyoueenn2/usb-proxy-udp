@@ -2,7 +2,7 @@
 
 ## Start and connect
 
-Build and start the Pi proxy as shown in [README.md](README.md). UDP listens on port **12345** only with `--enable_injection`. `USB_PROXY_BIND` selects the local IPv4 address (default `0.0.0.0`). `USB_PROXY_PEER` optionally restricts control to one source IPv4 address. The protocol is unauthenticated; use it only on a trusted LAN.
+Build and start the Pi proxy as shown in [DEPLOYMENT.md](DEPLOYMENT.md). UDP listens on port **12345** only with `--enable_injection`. `USB_PROXY_BIND` selects the local IPv4 address (default `0.0.0.0`). `USB_PROXY_PEER` optionally restricts control to one source IPv4 address. The protocol is unauthenticated; use it only on a trusted LAN.
 
 Move the physical mouse once after enumeration. `+state` returns `not_ready` until a supported descriptor and matching physical report have been observed. Unsupported physical reports continue through the proxy without modification.
 
@@ -302,7 +302,7 @@ The 10, 25, and 50 clicks-per-second checks in `make test` use a simulated USB w
 
 Run this procedure for each physical mouse or wireless-receiver mode before calling it supported:
 
-1. Record `lsusb` and `lsusb -v -d VID:PID` for the exact device. Start the live proxy with those IDs, the actual name from `/sys/class/udc/`, and `USB_PROXY_PEER` restricted to the Receiver PC. Confirm the target PC reports the captured VID/PID and a HID mouse. The sample Logitech IDs in the README are examples only.
+1. Record `lsusb` and `lsusb -v -d VID:PID` for the exact device. Start the live proxy with those IDs, the actual name from `/sys/class/udc/`, and `USB_PROXY_PEER` restricted to the Receiver PC. Confirm the target PC reports the captured VID/PID and a HID mouse. Do not assume a universal Logitech receiver ID.
 2. Move and click every physical button with UDP idle. Confirm press and release on the target, including a queued physical right-button release immediately followed by `+release` and by a 250 ms controller timeout. No button may reappear or remain stuck.
 3. Hold each physical button while applying and releasing a different UPX1 persistent hold. Repeat with both sources using the same button. The target must keep the button down until both contributing masks are released.
 4. Run single and multi-click UPC1 v2 commands at a conservative rate. Capture `accepted` and `completed` separately. Introduce a physical hold before admission and midway through a sequence; verify zero-count and partial-progress `button_active` responses respectively.
