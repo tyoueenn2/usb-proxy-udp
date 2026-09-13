@@ -309,8 +309,10 @@ EndpointSnapshot clear_synthetic_state() {
 
 bool take_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
     std::lock_guard<std::mutex> lock(registry_mutex);auto found=endpoints.find(address);
-    if(found==endpoints.end())return false;auto& endpoint=found->second;
-    if(endpoint.inflight)return false;uint64_t now=monotonic_ns();expire_front(endpoint,now);
+    if(found==endpoints.end())return false;
+    auto& endpoint=found->second;
+    if(endpoint.inflight)return false;
+    uint64_t now=monotonic_ns();expire_front(endpoint,now);
     std::lock_guard<std::mutex> queue_lock(*endpoint.info->data_mutex);auto& physical=*endpoint.info->data_queue;
     bool have_physical=!physical.empty(),have_synthetic=!endpoint.synthetic.empty();
     if(!have_physical&&!have_synthetic)return false;
@@ -348,7 +350,8 @@ bool take_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
     }
 
     auto& item=endpoint.synthetic.front();const auto& base=endpoint.submitted_template.empty()?endpoint.latest:endpoint.submitted_template;
-    if(base.empty())return false;io={};io.inner.ep=endpoint.info->ep_num;io.inner.length=endpoint.profile.size;
+    if(base.empty())return false;
+    io={};io.inner.ep=endpoint.info->ep_num;io.inner.length=endpoint.profile.size;
     std::memcpy(io.data,base.data(),base.size());
     for(const auto& field:endpoint.profile.relative)field.put(reinterpret_cast<uint8_t*>(io.data),0);
     MouseCommand command=item.remaining;command.buttons=item.persistent|item.scheduled;
@@ -360,7 +363,8 @@ bool take_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
 }
 
 void notify_mouse_report_written(uint8_t address,const usb_raw_transfer_io& io,bool success) {
-    if(!io.mouse_managed)return;uint64_t written=monotonic_ns();bool emit=false;WriterEvent event;
+    if(!io.mouse_managed)return;
+    uint64_t written=monotonic_ns();bool emit=false;WriterEvent event;
     {
         std::lock_guard<std::mutex> lock(registry_mutex);auto found=endpoints.find(address);
         if(found==endpoints.end())return;
