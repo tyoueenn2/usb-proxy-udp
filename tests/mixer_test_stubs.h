@@ -11,7 +11,8 @@ struct usb_raw_ep_io {uint16_t ep=0,flags=0;uint32_t length=0;};
 struct usb_endpoint_descriptor {uint8_t bEndpointAddress=0;};
 struct usb_raw_transfer_io {
     usb_raw_ep_io inner{};char data[MAX_TRANSFER_SIZE]{};
-    uint64_t injection_deadline_ns=0,mouse_generation=0,click_session=0,click_command=0;
+    uint64_t injection_deadline_ns=0,mouse_generation=0,mouse_endpoint_instance=0;
+    uint64_t click_session=0,click_command=0;
     uint64_t synthetic_item_id=0,physical_queued_ns=0;uint32_t click_index=0;
     int32_t synthetic_x=0,synthetic_y=0,synthetic_wheel=0,synthetic_pan=0;
     int32_t physical_x=0,physical_y=0,physical_wheel=0,physical_pan=0;

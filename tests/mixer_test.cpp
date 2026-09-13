@@ -185,6 +185,71 @@ void bounded_queue_and_cleanup() {
     assert(endpoint_snapshot().persistent==0&&endpoint_snapshot().scheduled==0);
 }
 
+void physical_completion_survives_synthetic_reset() {
+    Fixture f;
+    f.push_physical(2,0,0,1);auto held=f.take();f.complete(held);
+    auto generation=endpoint_snapshot().generation;
+
+    // A queued physical release remains valid when synthetic work is cancelled.
+    f.push_physical(0,0,0,2);clear_synthetic_state();
+    assert(endpoint_snapshot().generation==generation);
+    f.enqueue({},0,0,REPORT_RELEASE_ALL);
+    auto physical_release=f.take();assert(physical_release.mouse_physical&&Fixture::buttons(physical_release)==0);
+    bool fused_release=physical_release.mouse_report_kind==REPORT_RELEASE_ALL;f.complete(physical_release);
+    usb_raw_transfer_io final_release{};
+    if(!fused_release) {
+        final_release=f.take();assert(!final_release.mouse_physical&&Fixture::buttons(final_release)==0);
+        f.complete(final_release);
+    }
+
+    // The same accounting holds when the physical report was already taken by the writer.
+    f.push_physical(2,0,0,3);auto held_again=f.take();f.complete(held_again);
+    f.push_physical(0,0,0,4);auto inflight_release=f.take();
+    clear_synthetic_state();f.enqueue({},0,0,REPORT_RELEASE_ALL);
+    f.complete(inflight_release);
+    final_release=f.take();assert(Fixture::buttons(final_release)==0);f.complete(final_release);
+
+    // A failed physical release must preserve the last host-visible physical hold.
+    f.push_physical(2,0,0,5);auto visible_hold=f.take();f.complete(visible_hold);
+    f.push_physical(0,0,0,6);auto failed_release=f.take();
+    clear_synthetic_state();f.enqueue({},0,0,REPORT_RELEASE_ALL);f.complete(failed_release,false);
+    auto preserve_hold=f.take();assert(Fixture::buttons(preserve_hold)==2);f.complete(preserve_hold);
+    f.push_physical(0,0,0,7);auto recovered_release=f.take();
+    assert(Fixture::buttons(recovered_release)==0);f.complete(recovered_release);
+    f.enqueue({},0,0,REPORT_RELEASE_ALL);final_release=f.take();
+    assert(Fixture::buttons(final_release)==0);f.complete(final_release);
+}
+
+void physical_completion_survives_layout_change() {
+    Fixture f;
+    f.push_physical(2,0,0,1);auto held=f.take();f.complete(held);
+
+    // A genuine report already submitted to USB remains part of the ordered
+    // host-visible state even if the HID protocol changes before completion.
+    f.push_physical(0,0,0,2);auto old_layout_release=f.take();
+    auto old_generation=old_layout_release.mouse_generation;set_mouse_protocol(7,true);
+    assert(endpoint_snapshot().generation!=old_generation);f.complete(old_layout_release);
+
+    // Re-establish report protocol and a current template. The final synthetic
+    // release must use the completed physical release rather than resurrecting
+    // the prior right-button hold.
+    set_mouse_protocol(7,false);f.push_physical(0,0,0,3);auto current=f.take();f.complete(current);
+    f.enqueue({},0,0,REPORT_RELEASE_ALL);auto final_release=f.take();
+    assert(Fixture::buttons(final_release)==0);f.complete(final_release);
+}
+
+void stale_endpoint_completion_is_ignored() {
+    Fixture f;
+    f.push_physical(2,0,0,1);auto old_endpoint_hold=f.take();
+    unregister_mouse_endpoint(&f.info);register_mouse_endpoint(&f.info,7);
+    f.push_physical(0,0,0,2);auto replacement_release=f.take();f.complete(replacement_release);
+
+    // A completion from an endpoint registration that has already been replaced
+    // cannot overwrite the replacement endpoint's host-visible physical state.
+    f.complete(old_endpoint_hold);f.enqueue({},0,0,REPORT_RELEASE_ALL);
+    auto final_release=f.take();assert(Fixture::buttons(final_release)==0);f.complete(final_release);
+}
+
 void bounded_completion_events() {
     Fixture f;
     for(uint32_t index=0;index<20;++index) {
@@ -216,7 +281,9 @@ int main() {
     set_mouse_mixer_clock_for_test(fake_clock);
     physical_order_and_fusion();independent_button_masks_and_edges();
     overflow_supersession_failure_and_capacity();supersession_barriers();
-    bounded_queue_and_cleanup();bounded_completion_events();
+    bounded_queue_and_cleanup();physical_completion_survives_synthetic_reset();
+    physical_completion_survives_layout_change();stale_endpoint_completion_is_ignored();
+    bounded_completion_events();
     cadence_fairness_and_residence(8000);cadence_fairness_and_residence(1000);cadence_fairness_and_residence(125);
     set_mouse_mixer_clock_for_test(nullptr);
     std::cout<<"Mixer ordering, fusion, masks, overflow, retries, bounds, fairness and fake cadences passed\n";

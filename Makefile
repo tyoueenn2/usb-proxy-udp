@@ -32,6 +32,8 @@ test:
 	./tests/click-protocol-test
 	$(CXX) -std=c++17 -Wall -Wextra -Werror -I. tests/telemetry_test.cpp -o tests/telemetry-test
 	./tests/telemetry-test
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -I. tests/session_tracker_test.cpp -o tests/session-tracker-test
+	./tests/session-tracker-test
 	$(CXX) -std=c++17 -Wall -Wextra -Werror -DMOUSE_MIXER_TEST_STUBS -I. -Itests tests/mixer_test.cpp mouse_mixer.cpp -pthread -o tests/mixer-test
 	./tests/mixer-test
 	$(CXX) -std=c++17 -Wall -Wextra -I. tests/udp_test.cpp udp_server.cpp mouse_mixer.cpp usb_capture.cpp -pthread -ljsoncpp -o tests/udp-test
@@ -46,4 +48,4 @@ clean:
 	-rm *.o
 	-rm usb-proxy
 	-rm -f usb-replay tests/replay-test
-	-rm -f *.d tests/protocol-test tests/click-protocol-test tests/telemetry-test tests/mixer-test tests/udp-test
+	-rm -f *.d tests/protocol-test tests/click-protocol-test tests/telemetry-test tests/session-tracker-test tests/mixer-test tests/udp-test

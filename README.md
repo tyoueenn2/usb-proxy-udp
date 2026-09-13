@@ -39,13 +39,15 @@ cd usb-proxy-udp
 make -j4
 make test
 
-# Verify the gadget interface and find your mouse / receiver IDs:
+# Verify the gadget interface and find your exact mouse / receiver IDs:
 ls /dev/raw-gadget
 ls /sys/class/udc/
 lsusb
+# Replace VID:PID with the value from lsusb:
+sudo lsusb -v -d VID:PID
 ```
 
-`make` builds **both `usb-proxy` and `usb-replay`**. The commands below use `fe980000.usb` as the example UDC name and driver; check these against your Pi. The example VID/PID `046d:c539` is not a universal G Pro identifier—use the IDs reported for your mouse or receiver.
+`make` builds **both `usb-proxy` and `usb-replay`**. The commands below use `fe980000.usb` as the example UDC name and driver; check these against your Pi. The example VID/PID `046d:c539` is not a universal G Pro identifier. Logitech receivers and wired/wireless modes can enumerate differently, so copy the IDs reported by `lsusb` for the exact mode being proxied and save its verbose descriptor output with the test record.
 
 ## Quick start: live mouse plus UDP
 
@@ -59,6 +61,8 @@ sudo env USB_PROXY_PEER=192.168.1.10 ./usb-proxy \
 ```
 
 Let the target PC finish enumeration, then move the physical mouse once. The proxy learns a supported report layout and becomes ready for UDP input. Physical, persistent injected, and scheduled-click button state are tracked independently and merged with bitwise OR. A synthetic release therefore never clears a physical hold.
+
+On a normal stop, first send ReleaseAll and wait for its `completed` acknowledgment, then press Ctrl+C once. This gives the final merged release a confirmed USB-writer completion before endpoint teardown. After a mouse, receiver, target cable, or report-protocol change, allow enumeration to finish and move the physical mouse again so the new descriptor-defined layout and report template become ready.
 
 In **live mode**, `--enable_injection` starts UDP and loads the existing `injection.json` rules. Run from the checkout or pass `--injection_file` explicitly. The supplied rules are disabled by default. Without this option, live USB forwarding and optional recording still work, but UDP control is disabled.
 
@@ -135,9 +139,11 @@ While holding injected buttons, send a snapshot at least every 100 ms; `mouse.mo
 - **Fresh corrections:** only consecutive unsent movement corrections with the same persistent button state can replace each other. Physical reports, button transitions, click edges, wheel, and pan act as ordering barriers.
 - **USB-aware scheduling:** a release is not queued until the press has completed in the USB writer. Timing respects the selected interrupt endpoint's advertised polling interval and USB backpressure.
 - **Bounded overload:** click work, command history, physical reports, synthetic overlays, and writer events use fixed limits. New work receives `queue_full` instead of disappearing. With physical traffic queued, standalone synthetic reports receive at most one in four successful output opportunities and never go ahead of a physical depth of two or more.
+- **Receiver restarts:** 32 active session high-water marks rotate through a bounded retired-session tombstone set, so successive Receiver sessions do not permanently exhaust the server. Retired replay protection lasts 10 minutes and is bounded to 256 sessions; exact command results use a separate 256-record cache.
+- **Recoverable release:** an accepted ReleaseAll remains pending through temporary endpoint loss, layout replacement, watchdog cleanup, and USB-writer failure. It reports `completed` only after the complete merged release succeeds in the writer; a higher command ID can explicitly replace an older pending release.
 - **Expiry:** binary motion older than 25 ms since enqueue on the Pi is zeroed before USB submission; its button snapshot is retained. This does not measure network transit time or cancel a USB request already submitted.
 
-The legacy `UPS1`/`UPT1` and public 80-byte `UPS2`/`UPT2` layouts are preserved. `UPS3`/`UPT3` adds the poll interval, physical-only cumulative motion and report counters, queue depths, movement supersession, writer failures, and a monotonic snapshot time. For exact packet layouts, command syntax, status codes, limits, and restart behavior, see [USAGE.md](USAGE.md).
+Use `UPS3`/`UPT3` as the primary telemetry protocol. `UPT3` remains the exact 128-byte layout with poll interval, separate synthetic masks, physical-only cumulative motion and report counters, queue depths, movement supersession, writer failures, and monotonic snapshot time. The canonical 80-byte `UPT2` Receiver fallback keeps UPT1-compatible bytes 0–55, generation at 56, sample time at 64, signed physical dx/dy at 72/74, and physical-motion age at 76. For exact packet layouts, command syntax, status codes, limits, and restart behavior, see [USAGE.md](USAGE.md).
 
 ## Compatibility and limitations
 
@@ -174,11 +180,11 @@ For live USB troubleshooting, `--debug_level=3` prints outgoing report bytes. Re
 
 ## Validation
 
-`make test` includes HID encoding and malformed-descriptor tests, golden vectors for all UDP protocol versions, capture/replay roundtrips, Python retry tests, a deterministic mixer simulation, and a simulated USB-writer integration test. The mixer test covers ordered physical reports, report IDs and unknown bytes, fusion, overflow retention, independent masks, failed writes, bounded queues/events, fake 125/1000/8000 Hz cadences, the standalone cap, and the two-poll residence target. The integration test covers all acknowledgment states, exact and conflicting duplicates, lost responses, transient queue recovery, v2 completion-gated timing, watchdog, layout changes, USB write failure, shutdown cleanup, and simulated 10, 25, and 50 clicks per second. The [GitHub Actions workflow](.github/workflows/build.yml) builds and runs these tests on Linux.
+`make test` includes HID encoding and malformed-descriptor tests, golden vectors for all UDP protocol versions, capture/replay roundtrips, Python retry tests, a deterministic mixer simulation, a bounded session-lifecycle test, and a simulated USB-writer integration test. The mixer test covers ordered physical reports, queued and in-flight physical completion across synthetic resets and real layout changes, report IDs and unknown bytes, fusion, overflow retention, independent masks, failed writes, bounded queues/events, fake 125/1000/8000 Hz cadences, the standalone cap, and the two-poll residence target. The integration test covers all acknowledgment states, pre- and post-acceptance `button_active` counts, exact and conflicting duplicates, lost responses, recoverable ReleaseAll, more than 32 Receiver sessions, retired delayed commands, source-port changes, release admission under session pressure, transient queue recovery, v2 completion-gated timing, watchdog, layout changes, USB write failure, shutdown cleanup, and simulated 10, 25, and 50 clicks per second. The [GitHub Actions workflow](.github/workflows/build.yml) builds and runs these tests on Linux.
 
 The client can say a request was **submitted locally** when its datagram was sent. `accepted` means the Pi stored the command idempotently. `completed` means the required release completed successfully in the Pi's USB writer. Simulation does not prove that the destination USB stack observed an edge.
 
-The simulated click-rate checks establish scheduler correctness only. They do not establish a supported physical click rate or physical-report reliability. Measure the complete path on a Raspberry Pi 4 with its actual Raw Gadget endpoint and target USB host before publishing a hardware rate. Also verify enumeration, button behavior, disconnect/reconnect, suspend/resume, and latency on your setup.
+The simulated click-rate checks establish scheduler correctness only. They do not establish a supported physical click rate or physical-report reliability. Follow the [Raspberry Pi 4 hardware validation procedure](USAGE.md#raspberry-pi-4-hardware-validation) before publishing a hardware rate or claiming support for the G Pro Wireless or another gaming mouse.
 
 ## Documentation and credits
 

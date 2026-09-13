@@ -42,9 +42,12 @@ int main() {
     std::memcpy(request.data(),"UPS2",4);put64(request.data()+16,124);
     assert(subscription.accept(request.data(),request.size(),200)&&subscription.version==2);
     auto two=subscription.packet2(7,state);
-    golden(two,"55505432 01020104 0000000000000009 0000000000000007 000000000000007c "
-               "00000001 ffffff81 0000007f ffff8000 00007fff fffffffd 00000005 "
-               "00000032 00000031 0001 0002 000000000000004d");
+    golden(two,"55505432 01020000 0000000000000009 0000000000000007 000000000000007c "
+               "00000001 ffffff81 0000007f ffff8000 00007fff 00000000 "
+               "000000000000004d 0102030405060708 fffd 0005 00000063");
+    assert(two[6]==0&&two[7]==0&&get32(two.data()+52)==0&&get64(two.data()+56)==77&&
+           get64(two.data()+64)==state.snapshot_ns&&int16_t(click_protocol::get16(two.data()+72))==-3&&
+           int16_t(click_protocol::get16(two.data()+74))==5&&get32(two.data()+76)==99);
 
     std::memcpy(request.data(),"UPS3",4);put64(request.data()+16,125);
     assert(subscription.accept(request.data(),request.size(),300)&&subscription.version==3);

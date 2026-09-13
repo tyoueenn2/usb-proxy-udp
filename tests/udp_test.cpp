@@ -139,6 +139,15 @@ click_protocol::Ack recv_ack(int fd) {
     uint8_t bytes[128];int n=recv(fd,bytes,sizeof(bytes),0);assert(n>0);
     click_protocol::Ack ack;assert(click_protocol::parse_ack(bytes,size_t(n),ack));return ack;
 }
+click_protocol::Ack wait_fd_ack(int fd,uint64_t session,uint64_t command,Status status) {
+    auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+    while(std::chrono::steady_clock::now()<deadline) {
+        uint8_t bytes[128];int n=recv(fd,bytes,sizeof(bytes),0);if(n<=0)continue;
+        click_protocol::Ack ack;if(!click_protocol::parse_ack(bytes,size_t(n),ack))continue;
+        if(ack.session==session&&ack.command==command&&ack.status==status)return ack;
+    }
+    assert(false);return {};
+}
 
 void no_endpoint_statuses() {
     UdpServer server(19346);setenv("USB_PROXY_BIND","127.0.0.1",1);assert(server.start());
@@ -154,10 +163,59 @@ void no_endpoint_statuses() {
     auto release=click_protocol::request(click_protocol::Operation::ReleaseAll,77,2,0,0,0,0,
                                          click_protocol::VERSION2);
     assert(send(fd,release.data(),release.size(),0)==ssize_t(release.size()));
-    auto first=recv_ack(fd),second=recv_ack(fd);
-    assert(first.status==Status::Accepted&&second.status==Status::Cancelled);
-    assert(first.version==2&&second.version==2&&first.server_epoch!=0&&first.server_epoch==second.server_epoch);
-    close(fd);server.stop();
+    auto first=wait_fd_ack(fd,77,2,Status::Accepted);assert(first.version==2&&first.server_epoch!=0);
+    assert(send(fd,release.data(),release.size(),0)==ssize_t(release.size()));
+    assert(wait_fd_ack(fd,77,2,Status::Duplicate).accepted==0);
+
+    // A higher ID safely replaces the pending fence; delayed old IDs cannot become work again.
+    auto replacement=click_protocol::request(click_protocol::Operation::ReleaseAll,77,3,0,0,0,0,
+                                             click_protocol::VERSION2);
+    assert(send(fd,replacement.data(),replacement.size(),0)==ssize_t(replacement.size()));
+    assert(wait_fd_ack(fd,77,3,Status::Accepted).accepted==0);
+    assert(wait_fd_ack(fd,77,2,Status::Cancelled).completed==0);
+    assert(send(fd,release.data(),release.size(),0)==ssize_t(release.size()));
+    assert(wait_fd_ack(fd,77,2,Status::Cancelled).accepted==0);
+    assert(send(fd,schedule.data(),schedule.size(),0)==ssize_t(schedule.size()));
+    assert(wait_fd_ack(fd,77,1,Status::StaleCommand).accepted==0);
+
+    // Ownership timeout is cleanup activity, not cancellation of the accepted fence.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    assert(send(fd,replacement.data(),replacement.size(),0)==ssize_t(replacement.size()));
+    assert(wait_fd_ack(fd,77,3,Status::Duplicate).accepted==0);
+
+    // Readiness recovery, layout replacement and writer failures do not make
+    // the accepted replacement terminal.
+    std::deque<usb_raw_transfer_io> queue;std::mutex mutex;std::condition_variable cond;
+    std::atomic<bool> pending{false};thread_info info{};info.ep_num=1;info.endpoint.bEndpointAddress=0x81;
+    info.data_queue=&queue;info.data_mutex=&mutex;info.data_cond=&cond;info.mouse_poll_interval_us=1000;
+    info.mouse_synthetic_pending=&pending;set_mouse_protocol(0,true);register_mouse_endpoint(&info,0);
+    usb_raw_transfer_io physical{};physical.inner.length=3;
+    queue_physical_mouse_report(0x81,physical);{std::lock_guard<std::mutex> lock(mutex);queue.push_back(physical);}
+    cond.notify_all();auto layout_deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+    while(endpoint_snapshot().synthetic_pending==0&&std::chrono::steady_clock::now()<layout_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    assert(endpoint_snapshot().synthetic_pending==1);set_mouse_protocol(0,true);
+    usb_raw_transfer_io replacement_physical{};replacement_physical.inner.length=3;
+    queue_physical_mouse_report(0x81,replacement_physical);
+    {std::lock_guard<std::mutex> lock(mutex);queue.push_back(replacement_physical);}cond.notify_all();
+    unsigned attempts=0;
+    auto write_release=[&](bool success) {
+        auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+        while(std::chrono::steady_clock::now()<deadline) {
+            usb_raw_transfer_io io{};
+            if(!take_mouse_report(0x81,io)){std::this_thread::sleep_for(std::chrono::milliseconds(1));continue;}
+            notify_mouse_report_written(0x81,io,io.mouse_report_kind==REPORT_RELEASE_ALL?success:true);
+            if(io.mouse_report_kind==REPORT_RELEASE_ALL){++attempts;return;}
+        }
+        assert(false);
+    };
+    write_release(false);std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    write_release(true);assert(attempts==2);
+    // Treat the first Completed datagram as lost and recover it from the immutable retry.
+    assert(send(fd,replacement.data(),replacement.size(),0)==ssize_t(replacement.size()));
+    auto completed=wait_fd_ack(fd,77,3,Status::Completed);
+    assert(completed.version==2&&completed.server_epoch==first.server_epoch);
+    server.stop();unregister_mouse_endpoint(&info);close(fd);
 }
 
 int main() {
@@ -235,7 +293,16 @@ int main() {
     assert(f.wait_ack(session,23,Status::Accepted).accepted==1);
     assert(f.wait_until([&]{auto v=f.since(0);return std::any_of(v.begin(),v.end(),[](auto& row){return row.command==23&&row.kind==3;});}));
     f.physical(1);auto became_active=f.wait_ack(session,23,Status::ButtonActive,true);
-    assert(became_active.completed==0);f.physical(0);f.wait_synthetic(0);
+    assert(became_active.accepted==1&&became_active.completed==0);f.physical(0);f.wait_synthetic(0);
+
+    // A conflict after partial progress retains the original accepted count and truthful progress.
+    start=f.written_size();f.schedule(session,24,1,3,1000,50000,click_protocol::VERSION2);
+    assert(f.wait_ack(session,24,Status::Accepted).accepted==3);
+    assert(f.wait_until([&]{auto v=f.since(start);return std::any_of(v.begin(),v.end(),[](auto& row){
+        return row.command==24&&row.kind==REPORT_CLICK_RELEASE&&row.index==0;
+    });}));
+    f.physical(1);auto partial=f.wait_ack(session,24,Status::ButtonActive,true);
+    assert(partial.accepted==3&&partial.completed==1);f.physical(0);f.wait_synthetic(0);
 
     // Bounded scheduler queue reports overload, release-all cancels it, then capacity recovers.
     f.paused=true;
@@ -283,6 +350,43 @@ int main() {
         f.wait_synthetic(0);
     };
     rate(500,10);rate(501,25);rate(502,50);
+
+    // Receiver restarts do not exhaust the 32 active-session table.
+    for(uint64_t client=0;client<40;++client) {
+        uint64_t restarted=0x9000+client;f.schedule(restarted,10,1,1,1000,0,click_protocol::VERSION2);
+        assert(f.wait_ack(restarted,10,Status::Accepted).accepted==1);
+        assert(f.wait_ack(restarted,10,Status::Completed,true).completed==1);
+    }
+    f.schedule(0x9000,9,1,1,1000,0,click_protocol::VERSION2);
+    assert(f.wait_ack(0x9000,9,Status::StaleCommand).accepted==0);
+    f.schedule(0x9000,10,1,1,1000,0,click_protocol::VERSION2);
+    assert(f.wait_ack(0x9000,10,Status::Completed).completed==1);
+
+    // A terminal retry can move to a new source port after the old lease expires.
+    int moved=socket(AF_INET,SOCK_DGRAM,0);assert(moved>=0);timeval moved_timeout{1,0};
+    setsockopt(moved,SOL_SOCKET,SO_RCVTIMEO,&moved_timeout,sizeof(moved_timeout));
+    sockaddr_in moved_proxy{};moved_proxy.sin_family=AF_INET;moved_proxy.sin_port=htons(19345);
+    inet_pton(AF_INET,"127.0.0.1",&moved_proxy.sin_addr);
+    assert(connect(moved,reinterpret_cast<sockaddr*>(&moved_proxy),sizeof(moved_proxy))==0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    auto moved_retry=click_protocol::request(click_protocol::Operation::Schedule,0x9000,10,1,1,1000,0,
+                                             click_protocol::VERSION2);
+    assert(send(moved,moved_retry.data(),moved_retry.size(),0)==ssize_t(moved_retry.size()));
+    assert(wait_fd_ack(moved,0x9000,10,Status::Completed).completed==1);close(moved);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));f.upx();f.barrier();
+
+    // ReleaseAll remains admissible when all active session slots own pending work.
+    f.paused=true;
+    for(uint64_t client=0;client<32;++client) {
+        uint64_t protected_session=0xa000+client;
+        f.schedule(protected_session,20,1,1,1000,0,click_protocol::VERSION2);
+        assert(f.wait_ack(protected_session,20,Status::Accepted).accepted==1);
+    }
+    f.release_all(0xb000,20);assert(f.wait_ack(0xb000,20,Status::Accepted).accepted==0);
+    f.paused=false;f.cond.notify_all();
+    assert(f.wait_ack(0xb000,20,Status::Completed,true).completed==0);f.wait_synthetic(0);
+    f.schedule(0xa000,19,1,1,1000,0,click_protocol::VERSION2);
+    assert(f.wait_ack(0xa000,19,Status::StaleCommand).accepted==0);
 
     // Shutdown clears a persistent hold and leaves no synthetic button stuck.
     f.upx(0,0,1);f.wait_synthetic(1);f.server.stop();

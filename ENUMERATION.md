@@ -6,12 +6,14 @@ The live proxy forwards the physical mouse's USB descriptors and control request
 
 ## 1. Record with the real mouse connected
 
-Build both executables with `make -j4`. Connect the mouse/receiver to a Pi host port and the Pi's USB device port to the target PC. Replace the example USB IDs with those from `lsusb`:
+Build both executables with `make -j4`. Connect the mouse/receiver to a Pi host port and the Pi's USB device port to the target PC. Record the exact `lsusb` VID/PID and verbose descriptor output for the wired or wireless mode being tested; do not substitute an ID from another G Pro model or receiver:
 
 ```sh
 sudo ./usb-proxy --device=fe980000.usb --driver=fe980000.usb \
   --vendor_id=046d --product_id=c539 --record_usb=mouse.jsonl
 ```
+
+The values above are examples. Before starting, run `lsusb` and `sudo lsusb -v -d VID:PID`, then pass the reported hexadecimal values without the colon. Also verify that the UDC name passed as `--device` and `--driver` exists under `/sys/class/udc/`.
 
 Allow the host to finish enumeration, then move the mouse once. Stop with Ctrl+C. The recording option requires a new filename and refuses to overwrite an existing recording. If needed, reconnect the Pi device cable while recording to capture enumeration again; keep the mouse in the same operating mode. `--enable_injection` is optional during recording.
 
@@ -46,7 +48,7 @@ sudo env USB_PROXY_PEER=192.168.1.10 \
 
 Use your actual UDC name/driver. Replay starts the same UDP server on port 12345; the [Python client and command protocol](USAGE.md) work unchanged. Once the host selects the configuration, the replay mouse is initialized with neutral buttons and zero movement, so no physical movement is needed to make it ready. Captured relative motion and held buttons are cleared rather than replayed.
 
-The host should enumerate a HID mouse with the captured identity and report format. Check the HID/mouse device and hardware IDs on the host, then send a small move using `client.py`. This recognition and movement still require verification on your Pi and target PC.
+The host should enumerate a HID mouse with the captured identity and report format. Check the HID/mouse device and hardware IDs on the host against the recording, then send a small move using `client.py`. This recognition and movement still require verification on your Pi and target PC. After a target disconnect, reset, protocol switch, or endpoint replacement, wait for enumeration and a current report template before resuming control; a pending binary ReleaseAll will then be retried by the Pi until its writer completes it.
 
 Replay uses the same completion-aware synthetic mixer as live mode. It preserves the captured report ID and unknown report bytes in its template, clears relative fields for idle/`GET_REPORT` responses, and advances scheduled clicks only after successful Raw Gadget writer completion. Because replay has no physical source, its UPT3 physical counters remain zero.
 
@@ -65,6 +67,6 @@ The Pi's controller, electrical link, scheduling, and responses to unsupported r
 
 ## Tests and references
 
-`make test` includes capture-to-profile roundtrips, partial descriptor assembly, language-indexed strings, stalls, and malformed capture rejection. `usb-replay --check` validates an actual capture without hardware access. Hardware enumeration, suspend/resume, and motion tests must run on the Pi and target PC.
+`make test` includes capture-to-profile roundtrips, partial descriptor assembly, language-indexed strings, stalls, and malformed capture rejection. `usb-replay --check` validates an actual capture without hardware access. Hardware enumeration, suspend/resume, reconnect, physical-button release, and motion tests must run on the Pi and target PC; use the full checklist in [USAGE.md](USAGE.md#raspberry-pi-4-hardware-validation).
 
 The implementation uses [Linux Raw Gadget](https://docs.kernel.org/usb/raw-gadget.html) and the standard USB HID model described by [USB-IF HID specifications](https://www.usb.org/hid).

@@ -65,7 +65,7 @@ struct Endpoint {
     uint8_t persistent_buttons=0,scheduled_buttons=0;
     int physical_dx=0,physical_dy=0;
     int64_t cumulative_x=0,cumulative_y=0;
-    uint64_t generation=0,next_item=1,physical_barrier=0,last_motion_ns=0;
+    uint64_t generation=0,instance=0,next_item=1,physical_barrier=0,last_motion_ns=0;
     uint64_t physical_received=0,physical_submitted=0,superseded=0,writer_failures=0;
     uint8_t physical_successes_since_standalone=0;
     bool inflight=false;
@@ -74,6 +74,7 @@ struct Endpoint {
 
 std::mutex registry_mutex;
 uint64_t next_generation=0;
+uint64_t next_endpoint_instance=0;
 std::map<int,Endpoint> endpoints;
 std::map<int,std::vector<MouseProfile>> descriptors;
 std::map<int,std::vector<MouseProfile>> report_descriptors;
@@ -115,6 +116,7 @@ void apply_known_fields(const MouseProfile& profile,usb_raw_transfer_io& io,
 void describe_synthetic(Endpoint& endpoint,SyntheticItem& item,usb_raw_transfer_io& io,
                         const MouseCommand& applied,bool apply_buttons,bool standalone,bool competing) {
     io.mouse_managed=1;io.mouse_generation=endpoint.generation;io.synthetic_item_id=item.id;
+    io.mouse_endpoint_instance=endpoint.instance;
     io.click_session=item.session;io.click_command=item.command_id;io.click_index=item.click_index;
     io.click_button=item.click_button;io.mouse_report_kind=item.kind;
     io.persistent_buttons=item.persistent;io.scheduled_buttons=item.scheduled;
@@ -182,6 +184,7 @@ void set_mouse_protocol(int number,bool boot) {
 void register_mouse_endpoint(thread_info* info,int number) {
     std::lock_guard<std::mutex> lock(registry_mutex);Endpoint endpoint;
     endpoint.info=info;endpoint.interface_number=number;endpoint.generation=++next_generation;
+    endpoint.instance=++next_endpoint_instance;
     if(!info->mouse_poll_interval_us)info->mouse_poll_interval_us=1000;
     info->mouse_endpoint=true;
     if(info->mouse_synthetic_pending)info->mouse_synthetic_pending->store(false,std::memory_order_release);
@@ -204,7 +207,7 @@ void queue_physical_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
     if(found==endpoints.end())return;
     auto& endpoint=found->second;auto* bytes=reinterpret_cast<uint8_t*>(io.data);
     io.mouse_managed=1;io.mouse_physical=1;io.physical_queued_ns=monotonic_ns();
-    io.mouse_generation=endpoint.generation;++endpoint.physical_barrier;
+    io.mouse_generation=endpoint.generation;io.mouse_endpoint_instance=endpoint.instance;++endpoint.physical_barrier;
     auto* profile=matching_profile(endpoint,bytes,io.inner.length);
     if(!profile)return;
     if(endpoint.latest.empty()) {
@@ -299,7 +302,6 @@ EndpointSnapshot clear_synthetic_state() {
     auto& endpoint=found->second;endpoint.synthetic.clear();endpoint.inflight=false;endpoint.inflight_id=0;
     // The scheduler clears desired state immediately. These masks describe the last
     // successful USB write and become zero only when the final release completes.
-    endpoint.generation=++next_generation;
     update_pending(endpoint);endpoint.info->data_cond->notify_all();result.ready=!endpoint.latest.empty();
     result.physical=endpoint.physical_buttons;result.generation=endpoint.generation;
     result.poll_us=std::max<uint32_t>(1,endpoint.info->mouse_poll_interval_us);return result;
@@ -361,17 +363,21 @@ void notify_mouse_report_written(uint8_t address,const usb_raw_transfer_io& io,b
     if(!io.mouse_managed)return;uint64_t written=monotonic_ns();bool emit=false;WriterEvent event;
     {
         std::lock_guard<std::mutex> lock(registry_mutex);auto found=endpoints.find(address);
-        if(found==endpoints.end()||io.mouse_generation!=found->second.generation)return;
-        auto& endpoint=found->second;if(!success)++endpoint.writer_failures;
+        if(found==endpoints.end())return;
+        auto& endpoint=found->second;if(io.mouse_endpoint_instance!=endpoint.instance)return;
+        bool current_layout=io.mouse_generation==endpoint.generation;
+        if(!success&&current_layout)++endpoint.writer_failures;
         if(success&&io.mouse_physical) {
             endpoint.physical_successes_since_standalone=std::min<uint8_t>(3,endpoint.physical_successes_since_standalone+1);
             if(io.mouse_physical_match) {
                 ++endpoint.physical_submitted;endpoint.submitted_physical_buttons=io.physical_buttons;
-                usb_raw_transfer_io physical=io;
-                apply_known_fields(endpoint.profile,physical,io.physical_x,io.physical_y,
-                                   io.physical_wheel,io.physical_pan,io.physical_buttons);
-                endpoint.submitted_template.assign(reinterpret_cast<const uint8_t*>(physical.data),
-                                                   reinterpret_cast<const uint8_t*>(physical.data)+physical.inner.length);
+                if(current_layout) {
+                    usb_raw_transfer_io physical=io;
+                    apply_known_fields(endpoint.profile,physical,io.physical_x,io.physical_y,
+                                       io.physical_wheel,io.physical_pan,io.physical_buttons);
+                    endpoint.submitted_template.assign(reinterpret_cast<const uint8_t*>(physical.data),
+                                                       reinterpret_cast<const uint8_t*>(physical.data)+physical.inner.length);
+                }
                 if(io.physical_queued_ns&&written>=io.physical_queued_ns) {
                     endpoint.residence_ns.push_back(written-io.physical_queued_ns);
                     if(endpoint.residence_ns.size()>MAX_RESIDENCE_SAMPLES)endpoint.residence_ns.pop_front();
@@ -379,7 +385,7 @@ void notify_mouse_report_written(uint8_t address,const usb_raw_transfer_io& io,b
             }
         }
         if(success&&io.mouse_competing_standalone)endpoint.physical_successes_since_standalone=0;
-        if(io.synthetic_item_id&&endpoint.inflight&&endpoint.inflight_id==io.synthetic_item_id&&
+        if(current_layout&&io.synthetic_item_id&&endpoint.inflight&&endpoint.inflight_id==io.synthetic_item_id&&
            !endpoint.synthetic.empty()&&endpoint.synthetic.front().id==io.synthetic_item_id) {
             auto& item=endpoint.synthetic.front();
             if(success) {
@@ -392,8 +398,8 @@ void notify_mouse_report_written(uint8_t address,const usb_raw_transfer_io& io,b
             }
             endpoint.inflight=false;endpoint.inflight_id=0;if(success)remove_finished_front(endpoint);else update_pending(endpoint);
         }
-        if(io.mouse_report_kind==REPORT_CLICK_PRESS||io.mouse_report_kind==REPORT_CLICK_RELEASE||
-           io.mouse_report_kind==REPORT_RELEASE_ALL||!success) {
+        if(current_layout&&(io.mouse_report_kind==REPORT_CLICK_PRESS||io.mouse_report_kind==REPORT_CLICK_RELEASE||
+           io.mouse_report_kind==REPORT_RELEASE_ALL||!success)) {
             event={io.click_session,io.click_command,io.mouse_generation,written,io.click_index,
                    io.mouse_report_kind,io.click_button,io.click_blocked,io.mouse_final_buttons,success};emit=true;
         }

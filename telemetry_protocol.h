@@ -43,13 +43,13 @@ struct Subscription {
     }
     std::array<uint8_t,80> packet2(uint64_t server,const Snapshot& s) {
         std::array<uint8_t,80> p{};std::memcpy(p.data(),"UPT2",4);p[4]=s.ready;p[5]=s.physical;
-        p[6]=s.persistent;p[7]=s.scheduled;put64(p.data()+8,client);put64(p.data()+16,server);
+        put64(p.data()+8,client);put64(p.data()+16,server);
         put64(p.data()+24,token);put32(p.data()+32,sequence++);put32(p.data()+36,uint32_t(s.xmin));
         put32(p.data()+40,uint32_t(s.xmax));put32(p.data()+44,uint32_t(s.ymin));
-        put32(p.data()+48,uint32_t(s.ymax));put32(p.data()+52,uint32_t(s.physical_dx));
-        put32(p.data()+56,uint32_t(s.physical_dy));put32(p.data()+60,s.accepted);put32(p.data()+64,s.completed);
-        click_protocol::put16(p.data()+68,s.active);click_protocol::put16(p.data()+70,s.queued);
-        put64(p.data()+72,s.generation);return p;
+        put32(p.data()+48,uint32_t(s.ymax));put64(p.data()+56,s.generation);
+        put64(p.data()+64,s.snapshot_ns);click_protocol::put16(p.data()+72,uint16_t(int16_t(s.physical_dx)));
+        click_protocol::put16(p.data()+74,uint16_t(int16_t(s.physical_dy)));
+        put32(p.data()+76,s.physical_age_us);return p;
     }
     std::array<uint8_t,128> packet3(uint64_t server,const Snapshot& s) {
         std::array<uint8_t,128> p{};std::memcpy(p.data(),"UPT3",4);p[4]=s.ready;p[5]=s.physical;

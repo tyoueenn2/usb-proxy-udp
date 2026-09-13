@@ -101,6 +101,7 @@ struct usb_raw_transfer_io {
 	// Userspace-only metadata, outside the buffer passed to the kernel.
 	uint64_t injection_deadline_ns = 0;
 	uint64_t mouse_generation = 0;
+	uint64_t mouse_endpoint_instance = 0;
 	uint64_t click_session = 0;
 	uint64_t click_command = 0;
 	uint64_t synthetic_item_id = 0;

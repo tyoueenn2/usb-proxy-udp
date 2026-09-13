@@ -1,5 +1,6 @@
 #include "udp_server.h"
 #include "click_protocol.h"
+#include "session_tracker.h"
 #include "telemetry_protocol.h"
 #include <arpa/inet.h>
 #include <poll.h>
@@ -8,7 +9,6 @@
 #include <cstdlib>
 #include <array>
 #include <list>
-#include <map>
 #include <deque>
 #include <algorithm>
 #include <limits>
@@ -18,7 +18,6 @@ namespace {
 using Clock=std::chrono::steady_clock;
 constexpr size_t MAX_CLICK_COMMANDS=64;
 constexpr size_t MAX_CACHE_RECORDS=256;
-constexpr size_t MAX_CLIENT_SESSIONS=32;
 uint64_t now_ns(){return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();}
 uint32_t saturate(uint64_t value){return uint32_t(std::min<uint64_t>(value,std::numeric_limits<uint32_t>::max()));}
 
@@ -34,7 +33,6 @@ struct ClickWork {
     uint64_t press_written_ns=0,due_ns=0;ClickPhase phase=ClickPhase::AwaitPress;
     uint8_t version=click_protocol::VERSION1;bool blocked=false,binary=false;
 };
-struct SessionState {uint64_t highest=0;};
 bool same_request(const click_protocol::Request& a,const click_protocol::Request& b) {
     return a.version==b.version&&a.operation==b.operation&&a.button==b.button&&a.count==b.count&&
         a.press_us==b.press_us&&a.interval_us==b.interval_us;
@@ -67,7 +65,7 @@ void UdpServer::server_loop() {
     uint8_t persistent_buttons=0,scheduled_buttons=0;uint64_t tracked_generation=0;
     sockaddr_in owner{};bool owned=false,have_sequence=false;uint32_t last_sequence=0;
     auto last=Clock::now();std::list<CachedCommand> cache;std::deque<ClickWork> work;
-    std::map<uint64_t,SessionState> sessions;uint64_t accepted_total=0,completed_total=0;
+    click_sessions::Tracker sessions;uint64_t accepted_total=0,completed_total=0;
     bool release_pending=false,release_inflight=false;Key release_key{};
     proxy_telemetry::Subscription subscription;proxy_telemetry::Snapshot previous_telemetry;
     sockaddr_in subscriber{};uint64_t last_telemetry=0;
@@ -101,18 +99,15 @@ void UdpServer::server_loop() {
         scheduled_buttons=0;
     };
     auto begin_reset=[&](bool attach_release,const Key& key) {
-        if(release_key.session&&(!attach_release||!(release_key==key)))
+        if(attach_release&&release_key.session&&!(release_key==key))
             terminal(release_key,click_protocol::Status::Cancelled);
         cancel_work();persistent_buttons=scheduled_buttons=0;
         auto cleared=clear_synthetic_state();tracked_generation=cleared.generation;
-        // A layout change can temporarily leave the endpoint without a usable
-        // template. Keep an internal release pending until a matching physical
-        // report makes the endpoint ready again.
-        release_inflight=false;release_pending=cleared.ready||!attach_release;
-        if(attach_release) {
-            release_key=key;
-            if(!cleared.ready){release_pending=false;terminal(key,click_protocol::Status::Cancelled);release_key={};}
-        } else release_key={};
+        // Release is an obligation, not a one-shot enqueue. Temporary endpoint
+        // loss, layout changes, watchdog cleanup and writer failures leave it
+        // pending until a full writer completion is observed.
+        release_inflight=false;release_pending=true;
+        if(attach_release)release_key=key;
     };
     auto remove_old_cache=[&]() {
         while(cache.size()>=MAX_CACHE_RECORDS) {
@@ -124,7 +119,12 @@ void UdpServer::server_loop() {
         remove_old_cache();if(cache.size()>=MAX_CACHE_RECORDS)return nullptr;
         CachedCommand c;c.key={request.session,request.command};c.request=request;c.button=request.button;
         c.accepted=accepted;c.peer=from;
-        cache.push_back(c);sessions[request.session].highest=request.command;return &cache.back();
+        cache.push_back(c);return &cache.back();
+    };
+    auto session_protected=[&](uint64_t session) {
+        return std::any_of(cache.begin(),cache.end(),[&](const CachedCommand& command){
+            return command.key.session==session&&!command.terminal;
+        });
     };
     auto finish_front=[&](click_protocol::Status status) {
         if(work.empty())return;auto click=work.front();work.pop_front();scheduled_buttons=0;
@@ -190,12 +190,13 @@ void UdpServer::server_loop() {
     };
 
     while(running) {
-        process_writer_events();auto snapshot=endpoint_snapshot();
+        auto snapshot=endpoint_snapshot();
         if(!tracked_generation&&snapshot.ready)tracked_generation=snapshot.generation;
         if(tracked_generation&&snapshot.generation!=tracked_generation) {
             begin_reset(false,{});owned=false;have_sequence=false;
             snapshot=endpoint_snapshot();tracked_generation=snapshot.generation;
         }
+        process_writer_events();
         if(take_writer_overflow()) {
             begin_reset(false,{});owned=false;have_sequence=false;
         }
@@ -256,12 +257,9 @@ void UdpServer::server_loop() {
                 send_ack(from,prior->key,prior->button,prior->terminal?prior->status:click_protocol::Status::Duplicate,
                          prior->accepted,prior->completed,prior->request.version);continue;
             }
-            auto session=sessions.find(request.session);
-            if(session!=sessions.end()&&request.command<=session->second.highest) {
+            uint64_t request_now=now_ns();
+            if(sessions.stale(request.session,request.command,request_now)) {
                 send_ack(from,key,request.button,click_protocol::Status::StaleCommand,0,0,request.version);continue;
-            }
-            if(session==sessions.end()&&sessions.size()>=MAX_CLIENT_SESSIONS) {
-                send_ack(from,key,request.button,click_protocol::Status::QueueFull,0,0,request.version);continue;
             }
             auto e=endpoint_snapshot();
             if(request.operation==click_protocol::Operation::Schedule) {
@@ -283,8 +281,14 @@ void UdpServer::server_loop() {
                 if(work.size()>=MAX_CLICK_COMMANDS) {
                     send_ack(from,key,request.button,click_protocol::Status::QueueFull,0,0,request.version);continue;
                 }
+                remove_old_cache();
+                if(cache.size()>=MAX_CACHE_RECORDS||
+                   !sessions.admit(request.session,request_now,false,session_protected)) {
+                    send_ack(from,key,request.button,click_protocol::Status::QueueFull,0,0,request.version);continue;
+                }
                 auto* record=accept_record(request,from,request.count);
                 if(!record){send_ack(from,key,request.button,click_protocol::Status::QueueFull,0,0,request.version);continue;}
+                sessions.accept(request.session,request.command,request_now);
                 ClickWork click;click.key=key;click.button=request.button;click.count=request.count;
                 click.press_us=request.press_us;click.interval_us=request.interval_us;click.due_ns=now_ns();
                 click.version=request.version;click.binary=true;
@@ -292,11 +296,14 @@ void UdpServer::server_loop() {
                 owner=from;owned=true;last=Clock::now();tracked_generation=e.generation;
                 send_cached(*record,click_protocol::Status::Accepted);continue;
             }
-            if(release_pending&&release_key.session) {
+            remove_old_cache();
+            if(cache.size()>=MAX_CACHE_RECORDS||
+               !sessions.admit(request.session,request_now,true,session_protected)) {
                 send_ack(from,key,0,click_protocol::Status::QueueFull,0,0,request.version);continue;
             }
             auto* record=accept_record(request,from,0);
             if(!record){send_ack(from,key,0,click_protocol::Status::QueueFull,0,0,request.version);continue;}
+            sessions.accept(request.session,request.command,request_now);
             owner=from;owned=true;last=Clock::now();
             send_cached(*record,click_protocol::Status::Accepted);begin_reset(true,key);continue;
         }
