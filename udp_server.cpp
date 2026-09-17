@@ -2,6 +2,7 @@
 #include "click_protocol.h"
 #include "session_tracker.h"
 #include "telemetry_protocol.h"
+#include "upx_replay.h"
 #include <arpa/inet.h>
 #include <poll.h>
 #include <unistd.h>
@@ -63,9 +64,11 @@ void UdpServer::join(){if(server_thread.joinable())server_thread.join();}
 void UdpServer::server_loop() {
     const uint64_t server_epoch=random_epoch();
     uint8_t persistent_buttons=0,scheduled_buttons=0;uint64_t tracked_generation=0;
-    sockaddr_in owner{};bool owned=false,have_sequence=false;uint32_t last_sequence=0;
+    sockaddr_in owner{};bool owned=false;
     auto last=Clock::now();std::list<CachedCommand> cache;std::deque<ClickWork> work;
     click_sessions::Tracker sessions;uint64_t accepted_total=0,completed_total=0;
+    // This history is independent of the controller lease and synthetic resets.
+    upx_replay::Tracker movement_replay;
     bool release_pending=false,release_inflight=false;Key release_key{};
     proxy_telemetry::Subscription subscription;proxy_telemetry::Snapshot previous_telemetry;
     sockaddr_in subscriber{};uint64_t last_telemetry=0;
@@ -159,7 +162,7 @@ void UdpServer::server_loop() {
     auto process_writer_events=[&]() {
         for(const auto& event:take_writer_events()) {
             if(!event.success) {
-                begin_reset(false,{});owned=false;have_sequence=false;
+                begin_reset(false,{});owned=false;
                 continue;
             }
             if(event.kind==REPORT_RELEASE_ALL&&release_inflight&&event.session==release_key.session&&event.command==release_key.command) {
@@ -193,16 +196,16 @@ void UdpServer::server_loop() {
         auto snapshot=endpoint_snapshot();
         if(!tracked_generation&&snapshot.ready)tracked_generation=snapshot.generation;
         if(tracked_generation&&snapshot.generation!=tracked_generation) {
-            begin_reset(false,{});owned=false;have_sequence=false;
+            begin_reset(false,{});owned=false;
             snapshot=endpoint_snapshot();tracked_generation=snapshot.generation;
         }
         process_writer_events();
         if(take_writer_overflow()) {
-            begin_reset(false,{});owned=false;have_sequence=false;
+            begin_reset(false,{});owned=false;
         }
         auto now=Clock::now();
         if(owned&&now-last>std::chrono::milliseconds(250)) {
-            begin_reset(false,{});owned=false;have_sequence=false;
+            begin_reset(false,{});owned=false;
         }
         scheduler_tick(now_ns());
 
@@ -314,7 +317,9 @@ void UdpServer::server_loop() {
         if(owned&&!same_peer(owner,from)){reply("busy");continue;}
 
         if(n==16&&!std::memcmp(data,"UPX1",4)) {
-            uint32_t sequence=read_be32(data+4);if(data[15]||(have_sequence&&!sequence_newer(sequence,last_sequence)))continue;
+            uint32_t sequence=read_be32(data+4);uint64_t packet_now=now_ns();
+            upx_replay::Peer movement_peer{from.sin_addr.s_addr,from.sin_port};
+            if(data[15]||movement_replay.stale(movement_peer,sequence,packet_now))continue;
             MouseCommand command;command.x=read_i16(data+8);command.y=read_i16(data+10);
             command.wheel=data[12]<128?data[12]:int(data[12])-256;
             command.pan=data[13]<128?data[13]:int(data[13])-256;uint8_t next=data[14];
@@ -325,7 +330,7 @@ void UdpServer::server_loop() {
                 result=enqueue_report(command,next,scheduled_buttons,transition?REPORT_PERSISTENT:REPORT_MOVEMENT,
                     !transition&&movement&&!command.wheel&&!command.pan);
             if(result==EnqueueResult::Ok) {
-                persistent_buttons=next;last_sequence=sequence;have_sequence=true;
+                persistent_buttons=next;movement_replay.accept(movement_peer,sequence,packet_now);
                 owner=from;owned=true;last=Clock::now();tracked_generation=e.generation;
             }
             continue;

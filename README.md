@@ -17,7 +17,7 @@ Controller PC ──UDP───────────┘
 - Physical holds cannot be cleared by synthetic releases.
 - Ordered physical reports and button edges, with coalescing limited to compatible movement corrections.
 - Idempotent scheduled clicks timed on the Pi and completed through the USB writer.
-- Bounded queues, explicit overload responses, USB backpressure handling, and a 250 ms controller watchdog.
+- Bounded queues, bounded per-peer UPX1 replay protection, USB backpressure handling, and a 250 ms controller watchdog.
 - Enumeration capture and standalone HID mouse replay.
 - Physical-only direction and motion telemetry.
 

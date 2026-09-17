@@ -5,6 +5,9 @@
 #include <thread>
 #include <mutex>
 #include <vector>
+#include <array>
+#include <algorithm>
+#include <utility>
 #include <atomic>
 #include <functional>
 #include <iostream>
@@ -78,17 +81,26 @@ struct Fixture {
         }
     }
     void send_bytes(const void* bytes,size_t size){assert(send(fd,bytes,size,0)==ssize_t(size));}
+    static std::array<uint8_t,16> upx_packet(uint32_t sequence,int dx=0,int dy=0,uint8_t buttons=0,
+                                             int wheel=0,int pan=0) {
+        uint16_t x=uint16_t(dx),y=uint16_t(dy);
+        return {'U','P','X','1',uint8_t(sequence>>24),uint8_t(sequence>>16),uint8_t(sequence>>8),uint8_t(sequence),
+                uint8_t(x>>8),uint8_t(x),uint8_t(y>>8),uint8_t(y),uint8_t(wheel),uint8_t(pan),buttons,0};
+    }
+    void send_upx(uint32_t value,int dx=0,int dy=0,uint8_t buttons=0,int wheel=0,int pan=0) {
+        auto packet=upx_packet(value,dx,dy,buttons,wheel,pan);send_bytes(packet.data(),packet.size());
+    }
     void upx(int dx=0,int dy=0,uint8_t buttons=0,int wheel=0,int pan=0) {
-        uint32_t s=sequence++;uint8_t p[16]={'U','P','X','1',uint8_t(s>>24),uint8_t(s>>16),uint8_t(s>>8),uint8_t(s),
-            uint8_t(dx>>8),uint8_t(dx),uint8_t(dy>>8),uint8_t(dy),uint8_t(wheel),uint8_t(pan),buttons,0};send_bytes(p,sizeof(p));
+        send_upx(sequence++,dx,dy,buttons,wheel,pan);
     }
     void schedule(uint64_t session,uint64_t command,uint8_t button,uint32_t count,uint32_t press_us,uint32_t interval_us,
                   uint8_t version=click_protocol::VERSION1) {
         auto p=click_protocol::request(click_protocol::Operation::Schedule,session,command,button,count,press_us,interval_us,version);
         send_bytes(p.data(),p.size());
     }
-    void release_all(uint64_t session,uint64_t command) {
-        auto p=click_protocol::request(click_protocol::Operation::ReleaseAll,session,command);send_bytes(p.data(),p.size());
+    void release_all(uint64_t session,uint64_t command,uint8_t version=click_protocol::VERSION1) {
+        auto p=click_protocol::request(click_protocol::Operation::ReleaseAll,session,command,0,0,0,0,version);
+        send_bytes(p.data(),p.size());
     }
     bool receive(click_protocol::Ack* ack=nullptr,std::string* text=nullptr) {
         uint8_t bytes[256];int n=recv(fd,bytes,sizeof(bytes),0);if(n<=0)return false;
@@ -134,6 +146,115 @@ struct Fixture {
             return bool(in>>tag>>physical>>synthetic)&&unsigned(synthetic)==value;}));
     }
 };
+
+int test_client_socket(uint16_t local_port=0) {
+    int fd=socket(AF_INET,SOCK_DGRAM,0);assert(fd>=0);timeval timeout{1,0};
+    setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
+    if(local_port) {
+        int reuse=1;setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&reuse,sizeof(reuse));
+        sockaddr_in local{};local.sin_family=AF_INET;local.sin_port=htons(local_port);
+        inet_pton(AF_INET,"127.0.0.1",&local.sin_addr);
+        assert(bind(fd,reinterpret_cast<sockaddr*>(&local),sizeof(local))==0);
+    }
+    sockaddr_in proxy{};proxy.sin_family=AF_INET;proxy.sin_port=htons(19345);
+    inet_pton(AF_INET,"127.0.0.1",&proxy.sin_addr);
+    assert(connect(fd,reinterpret_cast<sockaddr*>(&proxy),sizeof(proxy))==0);return fd;
+}
+
+uint16_t local_port(int fd) {
+    sockaddr_in local{};socklen_t size=sizeof(local);
+    assert(getsockname(fd,reinterpret_cast<sockaddr*>(&local),&size)==0);
+    return ntohs(local.sin_port);
+}
+
+void send_upx_fd(int fd,uint32_t sequence,int dx=0,int dy=0,uint8_t buttons=0) {
+    auto packet=Fixture::upx_packet(sequence,dx,dy,buttons);
+    assert(send(fd,packet.data(),packet.size(),0)==ssize_t(packet.size()));
+}
+
+void delayed_upx_replay_tests() {
+    Fixture f;
+    f.physical(2); // Keep a physical right hold through ReleaseAll and timeout cleanup.
+    f.send_upx(1,0,0,1);f.wait_synthetic(1);
+    auto delayed_hold=Fixture::upx_packet(2,0,0,1);
+    f.release_all(0xd001,1,click_protocol::VERSION2);
+    assert(f.wait_ack(0xd001,1,Status::Accepted).version==click_protocol::VERSION2);
+    assert(f.wait_ack(0xd001,1,Status::Completed).completed==0);
+    f.send_upx(3);f.send_upx(4);f.send_upx(5);f.barrier();f.wait_synthetic(0);
+    assert(endpoint_snapshot().physical==2);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    size_t start=f.written_size();f.send_bytes(delayed_hold.data(),delayed_hold.size());f.barrier();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));f.wait_synthetic(0);
+    auto rows=f.since(start);
+    assert(std::none_of(rows.begin(),rows.end(),[](const Written& row){return row.buttons&1;}));
+    assert(endpoint_snapshot().physical==2);
+    auto physical_release=f.physical(0);assert(uint8_t(physical_release.data[0])==0);
+
+    // A delayed movement-only packet is stale after a newer snapshot and watchdog expiry.
+    f.send_upx(6);auto delayed_move=Fixture::upx_packet(7,44);f.send_upx(8);f.barrier();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    start=f.written_size();f.send_bytes(delayed_move.data(),delayed_move.size());f.barrier();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));rows=f.since(start);
+    assert(std::none_of(rows.begin(),rows.end(),[](const Written& row){return row.x==44;}));
+
+    // Duplicates and reordered packets remain stale on both sides of lease expiry.
+    auto current=Fixture::upx_packet(9,19),older=Fixture::upx_packet(8,18);
+    start=f.written_size();f.send_bytes(current.data(),current.size());f.barrier();
+    assert(f.wait_until([&]{auto current_rows=f.since(start);return std::count_if(
+        current_rows.begin(),current_rows.end(),[](const Written& row){return row.x==19;})==1;}));
+    f.send_bytes(current.data(),current.size());f.send_bytes(older.data(),older.size());f.barrier();
+    rows=f.since(start);
+    assert(std::count_if(rows.begin(),rows.end(),[](const Written& row){return row.x==19;})==1);
+    assert(std::none_of(rows.begin(),rows.end(),[](const Written& row){return row.x==18;}));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    f.send_bytes(current.data(),current.size());f.send_bytes(older.data(),older.size());f.barrier();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));rows=f.since(start);
+    assert(std::count_if(rows.begin(),rows.end(),[](const Written& row){return row.x==19;})==1);
+    assert(std::none_of(rows.begin(),rows.end(),[](const Written& row){return row.x==18;}));
+
+    // A malformed high sequence neither advances nor clears an existing baseline.
+    auto malformed=Fixture::upx_packet(100,100);malformed[15]=1;
+    f.send_bytes(malformed.data(),malformed.size());f.send_upx(10,20);f.barrier();
+    assert(f.wait_until([&]{auto current_rows=f.since(start);return std::count_if(
+        current_rows.begin(),current_rows.end(),[](const Written& row){return row.x==20;})==1;}));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    // A new source port establishes an independent random baseline and wraps modulo 2^32.
+    int wrap=test_client_socket();start=f.written_size();
+    for(const auto& item:std::array<std::pair<uint32_t,int>,4>{{
+            {0xfffffffeu,11},{0xffffffffu,12},{0,13},{1,14}}}) {
+        send_upx_fd(wrap,item.first,item.second);f.barrier();
+        assert(f.wait_until([&]{auto current_rows=f.since(start);return std::count_if(
+            current_rows.begin(),current_rows.end(),[&](const Written& row){return row.x==item.second;})==1;}));
+    }
+    send_upx_fd(wrap,0xffffffffu,99);f.barrier();rows=f.since(start);
+    for(int x:{11,12,13,14})
+        assert(std::count_if(rows.begin(),rows.end(),[&](const Written& row){return row.x==x;})==1);
+    assert(std::none_of(rows.begin(),rows.end(),[](const Written& row){return row.x==99;}));
+    close(wrap);std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    // Receiver restart on a new port accepts an unrelated initial sequence.
+    int restarted=test_client_socket();constexpr uint32_t random_start=0x8badf00du;
+    start=f.written_size();send_upx_fd(restarted,random_start,23);f.barrier();
+    assert(f.wait_until([&]{auto current_rows=f.since(start);return std::count_if(
+        current_rows.begin(),current_rows.end(),[](const Written& row){return row.x==23;})==1;}));
+    rows=f.since(start);
+    assert(std::count_if(rows.begin(),rows.end(),[](const Written& row){return row.x==23;})==1);
+
+    // Reusing the same source port within retention continues its old sequence space.
+    uint16_t reused_port=local_port(restarted);close(restarted);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    restarted=test_client_socket(reused_port);start=f.written_size();
+    send_upx_fd(restarted,random_start-1,55);f.barrier();
+    send_upx_fd(restarted,random_start+1,24);f.barrier();
+    assert(f.wait_until([&]{auto current_rows=f.since(start);return std::count_if(
+        current_rows.begin(),current_rows.end(),[](const Written& row){return row.x==24;})==1;}));
+    rows=f.since(start);
+    assert(std::none_of(rows.begin(),rows.end(),[](const Written& row){return row.x==55;}));
+    assert(std::count_if(rows.begin(),rows.end(),[](const Written& row){return row.x==24;})==1);
+    close(restarted);
+}
 
 click_protocol::Ack recv_ack(int fd) {
     uint8_t bytes[128];int n=recv(fd,bytes,sizeof(bytes),0);assert(n>0);
@@ -220,6 +341,7 @@ void no_endpoint_statuses() {
 
 int main() {
     no_endpoint_statuses();
+    delayed_upx_replay_tests();
     Fixture f;
     // Physical right hold is never cleared by a zero-button UPX1 movement.
     f.physical(2);size_t start=f.written_size();f.upx(9,0,0);
@@ -391,5 +513,5 @@ int main() {
     // Shutdown clears a persistent hold and leaves no synthetic button stuck.
     f.upx(0,0,1);f.wait_synthetic(1);f.server.stop();
     assert(f.wait_until([&]{std::lock_guard<std::mutex> lock(f.written_mutex);return !f.written.empty()&&f.written.back().buttons==0;}));
-    std::cout<<"UDP state, ordering, idempotency, overload, watchdog, generation, and 10/25/50 CPS simulation passed\n";
+    std::cout<<"UDP state, UPX1 replay, ordering, idempotency, overload, watchdog, generation, and 10/25/50 CPS simulation passed\n";
 }

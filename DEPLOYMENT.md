@@ -82,6 +82,8 @@ While holding injected buttons, send a `UPX1` snapshot at least every 100 ms. A 
 
 After 250 ms without valid `UPX1` traffic, an accepted command, or an exact retry, the watchdog cancels synthetic work, invalidates queued synthetic reports, and queues a merged release while preserving physical holds. The same cleanup applies to controller disconnect, invalid layout generation, endpoint change, and shutdown.
 
+The watchdog releases controller ownership but retains each source IP/port's UPX1 sequence baseline for 10 minutes. Up to 256 peers are retained with least-recently-accepted eviction. Restarted Receivers should use a new source port when they cannot continue the prior modulo-2^32 sequence. The replay-protection boundary and source-port reuse policy are defined in [USAGE.md](USAGE.md#upx1-movement-and-persistent-holds).
+
 Before a normal stop, send ReleaseAll and wait for its `completed` acknowledgment, then press Ctrl+C once. This confirms that the final merged release passed through the USB writer before endpoint teardown.
 
 After changing the physical mouse, receiver mode, target cable, report protocol, or endpoint, allow enumeration to finish and move the physical mouse again. This supplies a report template for the new descriptor-defined layout. A pending binary ReleaseAll is retried when the writer becomes available.
