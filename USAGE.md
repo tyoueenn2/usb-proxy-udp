@@ -316,3 +316,109 @@ Run this procedure for each physical mouse or wireless-receiver mode before call
 8. Before stopping the proxy, send ReleaseAll and wait for `completed`, then stop it with one Ctrl+C. Reconnect the physical receiver and target cable, repeat enumeration, and confirm neutral synthetic state. Exercise target suspend/resume and Pi reboot separately.
 
 Record the Pi kernel, Raw Gadget revision, mouse/receiver firmware and mode, USB descriptor capture, endpoint interval, target OS, packet-loss setup, and USB observation method with the results. A successful local writer return is not proof that the target observed an edge; use target-side event logging or USB capture for that distinction.
+
+## Ordered move, action, and return
+
+The updated proxy accepts one indivisible synthetic operation that moves out,
+settles, optionally clicks, and returns the synthetic counts actually written.
+Pixel coordinates must be calibrated and converted by Receiver or the controller.
+Existing UPX1 newest-correction packets must not be used for its individual stages.
+
+```python
+from client import MouseProxy
+
+with MouseProxy('192.168.1.20') as mouse:
+    print(mouse.capabilities())
+    result = mouse.move_action_return(300, -120, button=1,
+                                     settle_ms=2, press_ms=10, return_ms=0)
+    print(result['status'], result['remaining'], result['uncertain'])
+    # Movement-only probe, no click:
+    mouse.move_action_return(20, 0, button=0)
+```
+
+`on_midpoint=callback` requests a bounded wait at the intermediate position. Use
+external cursor/image feedback in the callback and return False to skip the click
+and request the return. Callback exceptions also cancel and return before being
+re-raised. Finish callbacks in less than one second. Retries keep one command ID
+and immutable payload; a lost completion acknowledgment cannot repeat the click.
+
+`completed` proves full successful USB-writer completion of all stages. The target
+computer still receives the movements. Application input timing and display
+refresh determine whether the action is consumed at the intermediate position or
+looks stationary. Actual landing/return precision requires position/image feedback.
+
+### Capability negotiation
+
+Send 24 bytes: `UPQ1 | version:u8=1 | reserved:3=0 | session:u64 | token:u64`.
+Both IDs must be nonzero. The 80-byte `UPI1` reply has version at 4, ready at 5,
+supported-button mask at 6, zero at 7, echoed session/token at 8/16, server epoch at
+24, endpoint generation at 32, polling microseconds at 40, signed X min/max and Y
+min/max at 44/48/52/56, zero at 60, stable HID-layout fingerprint at 64, maximum
+segments per direction (32) at 72, and zero at 76. Multibyte fields use network
+byte order. This query does not acquire controller ownership.
+
+### UPM1 request
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 0 | 4 | ASCII `UPM1` |
+| 4 | 1 | Version 1 |
+| 5 | 1 | Operation: execute 1, continue 2, cancel 3, query 4 |
+| 6 | 1 | Flags: bit 0 requests midpoint wait; other bits zero |
+| 7 | 1 | Button usage 1–8, or 0 for movement only |
+| 8 | 8 | Nonzero client session |
+| 16 | 8 | Nonzero monotonically increasing command ID |
+| 24 | 8 | Expected server epoch |
+| 32 | 8 | Expected endpoint generation |
+| 40 | 4 | Signed relative X counts, -32767 through 32767 |
+| 44 | 4 | Signed relative Y counts, -32767 through 32767 |
+| 48 | 4 | Settle time after outward writer completion, microseconds |
+| 52 | 4 | Press duration after press writer completion, microseconds |
+| 56 | 4 | Delay after release before return, microseconds |
+| 60 | 4 | Whole execution budget, 1000–5000000 microseconds |
+| 64 | 4 | Midpoint wait limit, up to 2000000 microseconds |
+| 68 | 12 | Reserved, zero |
+
+Settle, press and return delay are each limited to one second. A click press must
+span at least one endpoint polling interval. Midpoint requests need a positive
+wait limit. Continue/cancel/query must resend every immutable field of the original
+request, changing only operation. Continue is effective only while waiting;
+repeated controls never initiate another click. An expired midpoint wait skips
+the click and attempts the return. The total budget still applies during waits.
+
+Admission requires an idle synthetic queue, no persistent holds, a released click
+button, matching endpoint/epoch, and adequate segment/time budgets. Other held
+physical buttons may remain held for an action; movement-only probes require all
+buttons released. Physical motion, wheel/pan, or a button change interrupts the
+transaction. Physical reports retain their ordering and priority.
+
+Transactions share controller ownership, cached command IDs and retained session
+high-water marks with UPC1. Cross-protocol ID reuse is invalid. ReleaseAll fences
+earlier transaction commands. New movement/click commands are rejected/dropped
+while a transaction owns synthetic output; zero-button, zero-motion UPX1 heartbeat
+packets remain accepted without changing the transaction. Exact retries renew the
+250 ms ownership lease, including while waiting for external verification.
+
+### UPR1 reply
+
+The 96-byte reply has version at 4, status at 5, stage at 6, and flags at 7.
+Flags indicate uncertain in-flight displacement (1), successful press (2), and
+successful release (4). Session, command, epoch and endpoint generation occupy
+8/16/24/32. Six signed i32 fields at 40–60 contain outward X/Y, actual return X/Y,
+and residual X/Y. Return fields have the sign of the return movement; residual is
+outward plus return. Pi monotonic progress time is at 64. Bytes 72–95 are zero.
+
+Stages are idle 0, outward 1, settle 2, midpoint wait 3, press 4, hold 5, release 6,
+return delay 7, return 8, and done 9. Statuses are accepted 1, active 2, completed 3,
+busy 4, queue_full 5, invalid 6, not_ready 7, stale 8, button_active 9, interrupted
+10, cancelled 11, timeout 12, writer_failed 13, endpoint_changed 14, and range 15.
+Only accepted/active are nonterminal. Busy/queue_full reject before admission and
+can be retried unchanged. Terminal results are cached under the existing bounded
+session/cache retention rules.
+
+Normal Cancel skips an unstarted click, releases any synthetic press, and attempts
+a bounded return on the same endpoint. ReleaseAll, watchdog, physical interruption,
+writer failure, layout change and shutdown stop further transaction movement and
+leave the existing final-release obligation active. They may report a residual or
+uncertain return. Never treat writer completion as observed desktop position or
+replay displacement after an endpoint change.

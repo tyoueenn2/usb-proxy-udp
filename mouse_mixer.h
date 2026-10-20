@@ -13,7 +13,11 @@ enum ReportKind:uint8_t {
     REPORT_PERSISTENT,
     REPORT_CLICK_PRESS,
     REPORT_CLICK_RELEASE,
-    REPORT_RELEASE_ALL
+    REPORT_RELEASE_ALL,
+    REPORT_TRANSACTION_OUT,
+    REPORT_TRANSACTION_PRESS,
+    REPORT_TRANSACTION_RELEASE,
+    REPORT_TRANSACTION_RETURN
 };
 
 enum class EnqueueResult {Ok,NotReady,Unsupported,QueueFull};
@@ -25,7 +29,7 @@ struct EndpointSnapshot {
     uint32_t poll_us=1000,physical_age_us=0xffffffffu;
     uint32_t physical_received=0,physical_submitted=0,superseded=0,writer_failures=0;
     uint16_t output_queue=0,synthetic_pending=0;
-    uint64_t generation=0,snapshot_ns=0,last_motion_ns=0,p99_residence_ns=0;
+    uint64_t generation=0,snapshot_ns=0,last_motion_ns=0,p99_residence_ns=0,activity=0,layout=0;
     int64_t cumulative_x=0,cumulative_y=0;
 };
 
@@ -34,6 +38,7 @@ struct WriterEvent {
     uint32_t index=0;
     uint8_t kind=0,button=0,blocked=0,final_buttons=0;
     bool success=false;
+    int dx=0,dy=0;bool finished=false;
 };
 
 void register_mouse_endpoint(thread_info* info,int interface_number);
@@ -50,7 +55,8 @@ EndpointSnapshot endpoint_snapshot();
 std::string mouse_state_text();
 EnqueueResult enqueue_report(MouseCommand command,uint8_t persistent,uint8_t scheduled,
                              ReportKind kind,bool latest,uint64_t session=0,uint64_t command_id=0,
-                             uint32_t click_index=0,uint8_t click_button=0);
+                             uint32_t click_index=0,uint8_t click_button=0,
+                             uint64_t expected_activity=UINT64_MAX,uint64_t expected_generation=0);
 EndpointSnapshot clear_synthetic_state();
 std::vector<WriterEvent> take_writer_events();
 bool take_writer_overflow();

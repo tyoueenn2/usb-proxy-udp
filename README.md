@@ -17,6 +17,7 @@ Controller PC ──UDP───────────┘
 - Physical holds cannot be cleared by synthetic releases.
 - Ordered physical reports and button edges, with coalescing limited to compatible movement corrections.
 - Idempotent scheduled clicks timed on the Pi and completed through the USB writer.
+- Ordered move/click/return transactions with actual writer displacement accounting and bounded midpoint verification.
 - Bounded queues, bounded per-peer UPX1 replay protection, USB backpressure handling, and a 250 ms controller watchdog.
 - Enumeration capture and standalone HID mouse replay.
 - Physical-only direction and motion telemetry.
@@ -72,6 +73,6 @@ Follow [DEPLOYMENT.md](DEPLOYMENT.md) for Pi configuration, device discovery, st
 - [Deployment and operation](DEPLOYMENT.md)
 - [UDP protocol and Python client](USAGE.md)
 - [Enumeration recording and replay](ENUMERATION.md)
-- [GitHub Actions build and tests](.github/workflows/build.yml)
+- [GitHub Actions build and tests](.github/workflows/build.yml): GCC/Clang live and replay builds, transaction/UDP/Python regressions, and parser/movement-ledger sanitizers.
 
 Based on [AristoChen/usb-proxy](https://github.com/AristoChen/usb-proxy) and [xairy/raw-gadget](https://github.com/xairy/raw-gadget). The [original license](LICENSE) is retained.

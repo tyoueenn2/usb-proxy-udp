@@ -1,5 +1,6 @@
 #include "udp_server.h"
 #include "click_protocol.h"
+#include "move_executor.h"
 #include "session_tracker.h"
 #include "telemetry_protocol.h"
 #include "upx_replay.h"
@@ -27,6 +28,7 @@ struct CachedCommand {
     Key key;click_protocol::Request request;uint8_t button=0;uint32_t accepted=0,completed=0;
     click_protocol::Status status=click_protocol::Status::Accepted;bool terminal=false;
     sockaddr_in peer{};
+    bool movement=false;move_protocol::Request move_request;move_protocol::Ack move_ack;
 };
 enum class ClickPhase {AwaitPress,PressInflight,Holding,AwaitRelease,ReleaseInflight};
 struct ClickWork {
@@ -66,6 +68,7 @@ void UdpServer::server_loop() {
     uint8_t persistent_buttons=0,scheduled_buttons=0;uint64_t tracked_generation=0;
     sockaddr_in owner{};bool owned=false;
     auto last=Clock::now();std::list<CachedCommand> cache;std::deque<ClickWork> work;
+    MoveExecutor mover;
     click_sessions::Tracker sessions;uint64_t accepted_total=0,completed_total=0;
     // This history is independent of the controller lease and synthetic resets.
     upx_replay::Tracker movement_replay;
@@ -88,11 +91,20 @@ void UdpServer::server_loop() {
         auto packet=click_protocol::packet(ack);send_packet(to,packet.data(),packet.size());
     };
     auto send_cached=[&](CachedCommand& command,click_protocol::Status override_status) {
+        if(command.movement){auto packet=move_protocol::packet(command.move_ack);send_packet(command.peer,packet.data(),packet.size());return;}
         send_ack(command.peer,command.key,command.button,override_status,command.accepted,command.completed,
                  command.request.version);
     };
     auto terminal=[&](const Key& key,click_protocol::Status status) {
         if(auto* c=find_cache(key)){c->status=status;c->terminal=true;send_cached(*c,status);}
+    };
+    auto sync_move=[&]() {
+        const auto& a=mover.ack();if(!a.session)return;
+        if(auto* c=find_cache({a.session,a.command})){
+            bool changed=move_protocol::packet(c->move_ack)!=move_protocol::packet(a);
+            c->move_ack=a;c->terminal=move_protocol::terminal(a.status);
+            if(changed)send_cached(*c,c->status);
+        }
     };
     auto cancel_work=[&]() {
         while(!work.empty()) {
@@ -102,9 +114,11 @@ void UdpServer::server_loop() {
         scheduled_buttons=0;
     };
     auto begin_reset=[&](bool attach_release,const Key& key) {
+        mover.stop(move_protocol::Status::Cancelled,now_ns());sync_move();
         if(attach_release&&release_key.session&&!(release_key==key))
             terminal(release_key,click_protocol::Status::Cancelled);
-        cancel_work();persistent_buttons=scheduled_buttons=0;
+        mover.stop(move_protocol::Status::Cancelled,now_ns());sync_move();
+    cancel_work();persistent_buttons=scheduled_buttons=0;
         auto cleared=clear_synthetic_state();tracked_generation=cleared.generation;
         // Release is an obligation, not a one-shot enqueue. Temporary endpoint
         // loss, layout changes, watchdog cleanup and writer failures leave it
@@ -161,6 +175,7 @@ void UdpServer::server_loop() {
     };
     auto process_writer_events=[&]() {
         for(const auto& event:take_writer_events()) {
+            mover.event(event);sync_move();
             if(!event.success) {
                 begin_reset(false,{});owned=false;
                 continue;
@@ -207,6 +222,8 @@ void UdpServer::server_loop() {
         if(owned&&now-last>std::chrono::milliseconds(250)) {
             begin_reset(false,{});owned=false;
         }
+        if(mover.tick(endpoint_snapshot(),now_ns())){sync_move();begin_reset(false,{});}
+        sync_move();
         scheduler_tick(now_ns());
 
         auto telemetry_now=now_ns();
@@ -229,7 +246,7 @@ void UdpServer::server_loop() {
             }
         }
 
-        pollfd poller{sockfd,POLLIN,0};if(poll(&poller,1,2)<=0)continue;
+        pollfd poller{sockfd,POLLIN,0};if(poll(&poller,1,mover.active()?1:2)<=0)continue;
         uint8_t data[1024];sockaddr_in from{};socklen_t length=sizeof(from);
         int n=recvfrom(sockfd,data,sizeof(data),MSG_TRUNC,reinterpret_cast<sockaddr*>(&from),&length);
         if(n<=0||n>int(sizeof(data)))continue;if(peer_filter&&from.sin_addr.s_addr!=allowed.s_addr)continue;
@@ -239,6 +256,58 @@ void UdpServer::server_loop() {
             if(subscription.alive(now_ns())&&!same_peer(subscriber,from)){reply("busy");continue;}
             if(subscription.accept(data,size_t(n),now_ns())){subscriber=from;last_telemetry=0;}
             continue;
+        }
+        if(n>=4&&!std::memcmp(data,"UPQ1",4)) {
+            uint64_t session=0,token=0;
+            if(move_protocol::parse_query(data,size_t(n),session,token)) {
+                auto e=endpoint_snapshot();move_protocol::Capabilities c;
+                c.ready=e.ready;c.buttons=e.supported;c.session=session;c.token=token;c.epoch=server_epoch;
+                c.generation=e.generation;c.layout=e.layout;c.poll_us=e.poll_us;
+                c.xmin=e.xmin;c.xmax=e.xmax;c.ymin=e.ymin;c.ymax=e.ymax;
+                auto packet=move_protocol::packet(c);send_packet(from,packet.data(),packet.size());
+            }
+            continue;
+        }
+        if(n>=4&&!std::memcmp(data,"UPM1",4)) {
+            using MS=move_protocol::Status;using MO=move_protocol::Operation;
+            move_protocol::Request r;
+            if(!move_protocol::parse(data,size_t(n),r))continue;
+            Key key{r.session,r.command};
+            auto reject=[&](MS status){move_protocol::Ack a;a.session=r.session;a.command=r.command;
+                a.epoch=server_epoch;a.generation=endpoint_snapshot().generation;a.status=status;
+                auto packet=move_protocol::packet(a);send_packet(from,packet.data(),packet.size());};
+            if(owned&&!same_peer(owner,from)){reject(MS::Busy);continue;}
+            if(r.epoch!=server_epoch){reject(MS::EndpointChanged);continue;}
+            if(auto* prior=find_cache(key)) {
+                if(!prior->movement||!move_protocol::same(prior->move_request,r)){reject(MS::Invalid);continue;}
+                prior->peer=from;
+                if(!prior->terminal){
+                    if(r.operation==MO::Continue)mover.proceed();
+                    if(r.operation==MO::Cancel)mover.cancel();
+                }
+                owner=from;owned=true;last=Clock::now();send_cached(*prior,prior->status);continue;
+            }
+            if(r.operation!=MO::Execute||sessions.stale(r.session,r.command,now_ns())){reject(MS::Stale);continue;}
+            auto e=endpoint_snapshot();
+            if(!e.ready){reject(MS::NotReady);continue;}
+            if(e.generation!=r.generation){reject(MS::EndpointChanged);continue;}
+            if(mover.active()||!work.empty()||release_pending||e.synthetic_pending||e.output_queue){reject(MS::Busy);continue;}
+            if((r.button?(e.physical&(1u<<(r.button-1))):e.physical)||persistent_buttons||scheduled_buttons||e.persistent||e.scheduled){reject(MS::ButtonActive);continue;}
+            if(r.button&&(!(e.supported&(1u<<(r.button-1)))||r.press_us<e.poll_us)){reject(MS::Invalid);continue;}
+            auto segments=[](int n,int minimum,int maximum)->uint64_t {
+                if(!n)return 0;int64_t span=n>0?maximum:-int64_t(minimum);
+                return span>0?(uint64_t(n>0?n:-int64_t(n))+uint64_t(span)-1)/uint64_t(span):1000000;
+            };
+            uint64_t out=std::max(segments(r.dx,e.xmin,e.xmax),segments(r.dy,e.ymin,e.ymax));
+            uint64_t back=std::max(segments(-r.dx,e.xmin,e.xmax),segments(-r.dy,e.ymin,e.ymax));
+            uint64_t minimum=(out+back+(r.button?2:0))*e.poll_us+uint64_t(r.settle_us)+r.return_us+(r.button?r.press_us:0);
+            if(out>32||back>32||minimum>=r.budget_us){reject(MS::Range);continue;}
+            remove_old_cache();
+            if(cache.size()>=MAX_CACHE_RECORDS||!sessions.admit(r.session,now_ns(),false,session_protected)){reject(MS::QueueFull);continue;}
+            CachedCommand c;c.key=key;c.peer=from;c.movement=true;c.move_request=r;
+            mover.start(r,e,now_ns());c.move_ack=mover.ack();cache.push_back(c);
+            sessions.accept(r.session,r.command,now_ns());owner=from;owned=true;last=Clock::now();tracked_generation=e.generation;
+            send_cached(cache.back(),cache.back().status);continue;
         }
         if(n>=4&&!std::memcmp(data,"UPC1",4)) {
             click_protocol::Request request;
@@ -252,7 +321,7 @@ void UdpServer::server_loop() {
                 send_ack(from,key,request.button,click_protocol::Status::Busy,0,0,request.version);continue;
             }
             if(auto* prior=find_cache(key)) {
-                if(!same_request(prior->request,request)) {
+                if(prior->movement||!same_request(prior->request,request)) {
                     send_ack(from,key,request.button,click_protocol::Status::Invalid,0,0,request.version);continue;
                 }
                 owner=from;owned=true;last=Clock::now();
@@ -266,6 +335,7 @@ void UdpServer::server_loop() {
             }
             auto e=endpoint_snapshot();
             if(request.operation==click_protocol::Operation::Schedule) {
+                if(mover.active()){send_ack(from,key,request.button,click_protocol::Status::Busy,0,0,request.version);continue;}
                 if(!e.ready){send_ack(from,key,request.button,click_protocol::Status::NotReady,0,0,request.version);continue;}
                 if(request.button<1||request.button>8||!(e.supported&(1u<<(request.button-1)))) {
                     send_ack(from,key,request.button,click_protocol::Status::UnsupportedButton,0,0,request.version);continue;
@@ -324,6 +394,10 @@ void UdpServer::server_loop() {
             command.wheel=data[12]<128?data[12]:int(data[12])-256;
             command.pan=data[13]<128?data[13]:int(data[13])-256;uint8_t next=data[14];
             auto e=endpoint_snapshot();if(!e.ready||next&~e.supported)continue;
+            if(mover.active()){
+                if(!command.x&&!command.y&&!command.wheel&&!command.pan&&!next){owner=from;owned=true;last=Clock::now();}
+                continue;
+            }
             bool transition=next!=persistent_buttons;bool movement=command.x||command.y;
             EnqueueResult result=EnqueueResult::Ok;
             if(transition||movement||command.wheel||command.pan)
@@ -346,6 +420,7 @@ void UdpServer::server_loop() {
             if(stream>>extra){reply("error command");continue;}
             begin_reset(false,{});owner=from;owned=true;last=Clock::now();reply("ok");continue;
         }
+        if(mover.active()){reply("busy");continue;}
         MouseCommand command;int button=1,value=0;bool valid=false,click=false;uint8_t next=persistent_buttons;
         if(command_name=="+move")valid=bool(stream>>command.x>>command.y);
         else if(command_name=="+wheel")valid=bool(stream>>command.wheel);
@@ -380,6 +455,7 @@ void UdpServer::server_loop() {
         if(result!=EnqueueResult::Ok){reply("error not_ready_range_or_queue_full");continue;}
         persistent_buttons=next;owner=from;owned=true;last=Clock::now();tracked_generation=e.generation;reply("ok");
     }
+    mover.stop(move_protocol::Status::Cancelled,now_ns());sync_move();
     cancel_work();persistent_buttons=scheduled_buttons=0;clear_synthetic_state();
     enqueue_report(MouseCommand{},0,0,REPORT_RELEASE_ALL,false);
 }

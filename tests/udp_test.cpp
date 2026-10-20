@@ -1,6 +1,7 @@
 #include "host-raw-gadget.h"
 #include "udp_server.h"
 #include "click_protocol.h"
+#include "move_protocol.h"
 #include <arpa/inet.h>
 #include <thread>
 #include <mutex>
@@ -339,7 +340,47 @@ void no_endpoint_statuses() {
     server.stop();unregister_mouse_endpoint(&info);close(fd);
 }
 
+void move_transaction_udp() {
+    Fixture f;using namespace move_protocol;
+    auto q=query(0xdad,1);f.send_bytes(q.data(),q.size());std::array<uint8_t,1024> data{};Capabilities caps;
+    bool ready=false;
+    for(int i=0;i<20&&!ready;++i){int n=recv(f.fd,data.data(),data.size(),0);if(n>0)ready=parse_capabilities(data.data(),size_t(n),caps);}
+    assert(ready&&caps.ready&&caps.layout&&caps.epoch&&caps.max_segments==32);
+    auto wait=[&](uint64_t id,Stage stage,move_protocol::Status status){
+        Ack answer;bool found=false;
+        for(int i=0;i<150&&!found;++i){int n=recv(f.fd,data.data(),data.size(),0);Ack a;
+            if(n>0&&parse_ack(data.data(),size_t(n),a)&&a.command==id&&a.session==0xdad&&a.stage==stage&&a.status==status){answer=a;found=true;}}
+        if(!found)std::cerr<<"Missing transaction reply id="<<id<<" stage="<<int(stage)<<" status="<<int(status)<<"\n";
+        assert(found);return answer;
+    };
+    auto send=[&](Request r){auto p=packet(r);f.send_bytes(p.data(),p.size());};
+    Request r;r.session=0xdad;r.command=10;r.epoch=caps.epoch;r.generation=caps.generation;r.dx=300;r.dy=-200;r.button=1;r.press_us=1000;
+    auto start=f.written_size();send(r);auto done=wait(10,Stage::Done,move_protocol::Status::Completed);
+    assert(done.out_x==300&&done.return_x==-300&&!done.residual_x&&!done.residual_y&&(done.flags&6)==6);
+    auto written=f.written_size();send(r);wait(10,Stage::Done,move_protocol::Status::Completed);assert(f.written_size()==written);
+    auto changed=r;changed.dx=301;send(changed);wait(10,Stage::Idle,move_protocol::Status::Invalid);
+    auto rows=f.since(start);int x=0,y=0,press=0,release=0;
+    for(const auto& row:rows){x+=row.x;y+=row.y;press+=row.kind==REPORT_TRANSACTION_PRESS;release+=row.kind==REPORT_TRANSACTION_RELEASE;}
+    assert(x==0&&y==0&&press==1&&release==1);
+    f.schedule(0xdad,10,1,1,1000,0,click_protocol::VERSION2);f.wait_ack(0xdad,10,click_protocol::Status::Invalid);
+    r.command=11;r.dx=20;r.dy=0;r.flags=1;send(r);wait(11,Stage::Waiting,move_protocol::Status::Active);
+    r.operation=Operation::Cancel;send(r);auto cancelled=wait(11,Stage::Done,move_protocol::Status::Cancelled);
+    assert(!cancelled.residual_x&&!(cancelled.flags&2));
+    r.command=12;r.operation=Operation::Execute;send(r);wait(12,Stage::Waiting,move_protocol::Status::Active);
+    f.release_all(0xdad,13);wait(12,Stage::Done,move_protocol::Status::Cancelled);
+    f.wait_ack(0xdad,13,click_protocol::Status::Completed,true);
+    r.command=9;send(r);wait(9,Stage::Idle,move_protocol::Status::Stale);
+    // A held activation button is compatible with a different synthetic click.
+    f.physical(2);r.command=14;r.dx=5;r.flags=0;send(r);
+    wait(14,Stage::Done,move_protocol::Status::Completed);assert(f.since(0).back().buttons==2);f.physical(0);
+    // Physical motion takes priority and never creates an inverse physical movement.
+    r.command=15;r.flags=1;send(r);wait(15,Stage::Waiting,move_protocol::Status::Active);
+    f.physical(0,3,0);auto interrupted=wait(15,Stage::Done,move_protocol::Status::Interrupted);
+    assert(!(interrupted.flags&2)&&interrupted.residual_x==5);
+}
+
 int main() {
+    move_transaction_udp();
     no_endpoint_statuses();
     delayed_upx_replay_tests();
     Fixture f;
