@@ -141,6 +141,116 @@ class MouseProxy:
             round(press_ms * 1000), round(interval_ms * 1000), 0)
         return self._reliable_request(packet, command, wait_complete, timeout, retry_interval, protocol_version)
 
+    def capabilities(self, timeout=1.0):
+        """Negotiate move/return support without changing old telemetry formats."""
+        token = secrets.randbits(64) or 1
+        request = struct.pack('!4sB3xQQ', b'UPQ1', 1, self.session, token)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.socket.send(request)
+            self.socket.settimeout(min(0.05, max(0.001, deadline-time.monotonic())))
+            try:
+                packet = self.socket.recv(1024)
+            except socket.timeout:
+                continue
+            if len(packet) != 80 or packet[:4] != b'UPI1' or packet[4] != 1:
+                ack = self._parse_ack(packet)
+                if ack:
+                    self._acks.append(ack)
+                continue
+            session, echoed, epoch, generation = struct.unpack_from('!QQQQ', packet, 8)
+            if session != self.session or echoed != token:
+                continue
+            poll, xmin, xmax, ymin, ymax = struct.unpack_from('!Iiiii', packet, 40)
+            layout, segments = struct.unpack_from('!QI', packet, 64)
+            if packet[5] > 1 or packet[7] or any(packet[60:64]) or any(packet[76:]):
+                continue
+            if not epoch or (packet[5] and (not generation or not layout or not poll or not xmin < 0 < xmax or not ymin < 0 < ymax or segments != 32)):
+                continue
+            return dict(ready=bool(packet[5]), buttons=packet[6], epoch=epoch,
+                        generation=generation, poll_us=poll, xmin=xmin, xmax=xmax,
+                        ymin=ymin, ymax=ymax, layout=layout, max_segments=segments)
+        raise TimeoutError('Pi has no move/return capability response; update the proxy')
+
+    @staticmethod
+    def _parse_move_ack(packet):
+        if len(packet) != 96 or packet[:4] != b'UPR1' or packet[4] != 1:
+            return None
+        if not 1 <= packet[5] <= 15 or packet[6] > 9 or packet[7] & ~7 or any(packet[72:]):
+            return None
+        session, command, epoch, generation = struct.unpack_from('!QQQQ', packet, 8)
+        ox, oy, rx, ry, remaining_x, remaining_y, written = struct.unpack_from('!iiiiiiQ', packet, 40)
+        names = ('unknown', 'accepted', 'active', 'completed', 'busy', 'queue_full',
+                 'invalid', 'not_ready', 'stale', 'button_active', 'interrupted',
+                 'cancelled', 'timeout', 'writer_failed', 'endpoint_changed', 'range')
+        return dict(status=names[packet[5]], status_code=packet[5], stage=packet[6],
+                    uncertain=bool(packet[7] & 1), pressed=bool(packet[7] & 2),
+                    released=bool(packet[7] & 4), session=session, command=command,
+                    epoch=epoch, generation=generation, outward=(ox, oy), returned=(rx, ry),
+                    remaining=(remaining_x, remaining_y), written_ns=written)
+
+    def move_action_return(self, dx, dy, button=1, settle_ms=2, press_ms=10,
+                           return_ms=0, timeout=6.0, on_midpoint=None):
+        """One ordered Pi operation in HID counts. button=0 performs no click.
+
+        on_midpoint optionally verifies external position before the click. It must
+        finish within one second; return False to skip the click and return.
+        Retries use one immutable payload and command ID, never repeat the action.
+        Completion proves USB-writer success, not application consumption.
+        """
+        caps = self.capabilities()
+        if not caps['ready']:
+            raise RuntimeError('Pi mouse endpoint is not ready')
+        if not -32767 <= dx <= 32767 or not -32767 <= dy <= 32767 or not 0 <= button <= 8:
+            raise ValueError('Invalid movement or button')
+        timing = (round(settle_ms*1000), max(round(press_ms*1000), caps['poll_us']), round(return_ms*1000))
+        if any(n < 0 or n > 1_000_000 for n in timing):
+            raise ValueError('Timing must be between zero and 1000 milliseconds')
+        command = self._next_command()
+        base = bytearray(struct.pack('!4sBBBBQQQQiiIIIII12x', b'UPM1', 1, 1,
+            int(on_midpoint is not None), button, self.session, command, caps['epoch'],
+            caps['generation'], dx, dy, *timing, 5_000_000, 1_500_000))
+        deadline = time.monotonic() + timeout
+        next_send = 0.0
+        handled_midpoint = False
+        callback_error = None
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_send:
+                self.socket.send(base)
+                next_send = now + 0.02
+            self.socket.settimeout(max(0.001, min(next_send, deadline)-time.monotonic()))
+            try:
+                incoming = self.socket.recv(1024)
+            except socket.timeout:
+                continue
+            ack = self._parse_move_ack(incoming)
+            if not ack or ack['session'] != self.session or ack['command'] != command:
+                continue
+            if ack['epoch'] != caps['epoch'] or ack['generation'] != caps['generation']:
+                raise RuntimeError('Pi restarted during the operation; return is unverified')
+            if ack['status_code'] in (4, 5):
+                continue  # Rejected before admission; retry the same request.
+            if ack['status_code'] > 2:
+                if callback_error:
+                    raise callback_error
+                return ack
+            if ack['stage'] == 3 and on_midpoint is not None and not handled_midpoint:
+                handled_midpoint = True
+                try:
+                    proceed = on_midpoint(ack) is not False
+                except Exception as error:
+                    callback_error = error
+                    proceed = False
+                base[5] = 2 if proceed else 3
+                next_send = 0.0
+        # ReleaseAll fences this command, so delayed Execute packets cannot repeat it.
+        try:
+            self.release_all(timeout=0.5, protocol_version=2)
+        except (OSError, TimeoutError):
+            pass
+        raise TimeoutError('Move/return completion was not received; position is unverified')
+
     def release_all(self, wait_complete=True, timeout=1.0, retry_interval=0.05,
                     protocol_version=1):
         """Clear persistent holds, cancel scheduled clicks, and request a merged release."""

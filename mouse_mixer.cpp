@@ -46,7 +46,7 @@ bool no_motion(const MouseCommand& command) {
 
 struct SyntheticItem {
     uint64_t id=0,generation=0,deadline_ns=0,physical_barrier=0;
-    uint64_t session=0,command_id=0;
+    uint64_t session=0,command_id=0,guard_activity=UINT64_MAX;
     uint32_t click_index=0;
     MouseCommand remaining;
     uint8_t persistent=0,scheduled=0,click_button=0;
@@ -66,7 +66,7 @@ struct Endpoint {
     int physical_dx=0,physical_dy=0;
     int64_t cumulative_x=0,cumulative_y=0;
     uint64_t generation=0,instance=0,next_item=1,physical_barrier=0,last_motion_ns=0;
-    uint64_t physical_received=0,physical_submitted=0,superseded=0,writer_failures=0;
+    uint64_t physical_received=0,physical_submitted=0,superseded=0,writer_failures=0,activity=0;
     uint8_t physical_successes_since_standalone=0;
     bool inflight=false;
     uint64_t inflight_id=0;
@@ -124,7 +124,7 @@ void describe_synthetic(Endpoint& endpoint,SyntheticItem& item,usb_raw_transfer_
     io.synthetic_wheel=applied.wheel;io.synthetic_pan=applied.pan;
     io.synthetic_apply_buttons=apply_buttons;io.mouse_standalone=standalone;
     io.mouse_competing_standalone=competing;
-    if(item.kind==REPORT_CLICK_PRESS&&item.click_button) {
+    if((item.kind==REPORT_CLICK_PRESS||item.kind==REPORT_TRANSACTION_PRESS)&&item.click_button) {
         uint8_t previously_visible=endpoint.submitted_physical_buttons|
             endpoint.persistent_buttons|endpoint.scheduled_buttons;
         io.click_blocked=(previously_visible&(1u<<(item.click_button-1)))!=0;
@@ -147,7 +147,7 @@ void expire_front(Endpoint& endpoint,uint64_t now) {
         }
         bool needs_buttons=!item.buttons_committed&&
             (item.persistent!=endpoint.persistent_buttons||item.scheduled!=endpoint.scheduled_buttons||
-             item.kind==REPORT_RELEASE_ALL);
+             item.kind==REPORT_RELEASE_ALL||item.kind>=REPORT_TRANSACTION_OUT);
         if(no_motion(item.remaining)&&!needs_buttons)endpoint.synthetic.pop_front();
         else break;
     }
@@ -216,6 +216,7 @@ void queue_physical_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
     endpoint.latest.assign(bytes,bytes+io.inner.length);io.mouse_physical_match=1;
     io.physical_buttons=profile->button_mask(bytes);io.physical_x=profile->x.get(bytes);io.physical_y=profile->y.get(bytes);
     io.physical_wheel=profile->wheel.get(bytes);io.physical_pan=profile->pan.get(bytes);
+    if(io.physical_x||io.physical_y||io.physical_wheel||io.physical_pan||endpoint.physical_buttons!=io.physical_buttons)++endpoint.activity;
     endpoint.physical_buttons=io.physical_buttons;endpoint.physical_dx=io.physical_x;endpoint.physical_dy=io.physical_y;
     endpoint.cumulative_x=saturating_add(endpoint.cumulative_x,io.physical_x);
     endpoint.cumulative_y=saturating_add(endpoint.cumulative_y,io.physical_y);
@@ -242,6 +243,15 @@ EndpointSnapshot endpoint_snapshot() {
     auto& endpoint=found->second;snapshot.ready=true;snapshot.physical=endpoint.physical_buttons;
     snapshot.persistent=endpoint.persistent_buttons;snapshot.scheduled=endpoint.scheduled_buttons;
     snapshot.xmin=endpoint.profile.x.minimum;snapshot.xmax=endpoint.profile.x.maximum;
+    snapshot.activity=endpoint.activity;
+    // Stable layout fingerprint, independent of process/generation numbers.
+    uint64_t layout=1469598103934665603ull;
+    auto hash=[&](uint64_t n){for(int i=0;i<8;++i){layout^=uint8_t(n);layout*=1099511628211ull;n>>=8;}};
+    hash(endpoint.profile.id);hash(endpoint.profile.size);
+    auto field=[&](const HidField& f){hash(f.offset);hash(f.bits);hash(uint32_t(f.minimum));hash(uint32_t(f.maximum));};
+    field(endpoint.profile.x);field(endpoint.profile.y);field(endpoint.profile.wheel);field(endpoint.profile.pan);
+    for(const auto& b:endpoint.profile.buttons){hash(b.first);field(b.second);}
+    snapshot.layout=layout?layout:1;
     snapshot.ymin=endpoint.profile.y.minimum;snapshot.ymax=endpoint.profile.y.maximum;
     snapshot.physical_dx=endpoint.physical_dx;snapshot.physical_dy=endpoint.physical_dy;
     snapshot.poll_us=std::max<uint32_t>(1,endpoint.info->mouse_poll_interval_us);snapshot.generation=endpoint.generation;
@@ -275,10 +285,13 @@ std::string mouse_state_text() {
 
 EnqueueResult enqueue_report(MouseCommand command,uint8_t persistent,uint8_t scheduled,
                              ReportKind kind,bool latest,uint64_t session,uint64_t command_id,
-                             uint32_t click_index,uint8_t click_button) {
+                             uint32_t click_index,uint8_t click_button,uint64_t expected_activity,uint64_t expected_generation) {
     std::lock_guard<std::mutex> lock(registry_mutex);auto found=endpoints.find(selected);
     if(found==endpoints.end()||found->second.latest.empty())return EnqueueResult::NotReady;
-    auto& endpoint=found->second;command.buttons=persistent|scheduled;
+    auto& endpoint=found->second;
+    if((expected_generation&&endpoint.generation!=expected_generation)||
+       (expected_activity!=UINT64_MAX&&endpoint.activity!=expected_activity))return EnqueueResult::NotReady;
+    command.buttons=persistent|scheduled;
     if(split_mouse_command(endpoint.profile,command).empty())return EnqueueResult::Unsupported;
     if(latest)while(!endpoint.synthetic.empty()) {
         const auto& tail=endpoint.synthetic.back();
@@ -291,7 +304,7 @@ EnqueueResult enqueue_report(MouseCommand command,uint8_t persistent,uint8_t sch
     item.deadline_ns=latest?monotonic_ns()+25000000:0;item.physical_barrier=endpoint.physical_barrier;
     item.session=session;item.command_id=command_id;item.click_index=click_index;item.remaining=command;
     item.persistent=persistent;item.scheduled=scheduled;item.click_button=click_button;
-    item.kind=kind;item.latest=latest;endpoint.synthetic.push_back(item);update_pending(endpoint);
+    item.guard_activity=expected_activity;item.kind=kind;item.latest=latest;endpoint.synthetic.push_back(item);update_pending(endpoint);
     endpoint.info->data_cond->notify_all();return EnqueueResult::Ok;
 }
 
@@ -315,16 +328,24 @@ bool take_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
     uint64_t now=monotonic_ns();expire_front(endpoint,now);
     std::lock_guard<std::mutex> queue_lock(*endpoint.info->data_mutex);auto& physical=*endpoint.info->data_queue;
     bool have_physical=!physical.empty(),have_synthetic=!endpoint.synthetic.empty();
+    if(have_synthetic&&endpoint.synthetic.front().guard_activity!=UINT64_MAX&&
+       endpoint.synthetic.front().guard_activity!=endpoint.activity)have_synthetic=false;
     if(!have_physical&&!have_synthetic)return false;
 
     bool fuse=false,buttons_only=false,standalone=false,competing=false;
+    MouseCommand fusion_motion;
     if(have_synthetic&&have_physical) {
         auto& item=endpoint.synthetic.front();const auto& candidate=physical.front();
         bool compatible=candidate.mouse_physical_match&&candidate.mouse_generation==endpoint.generation;
-        fuse=compatible&&motion_fits(endpoint.profile,candidate,item.remaining);
+        fusion_motion=item.remaining;
+        if(item.kind>=REPORT_TRANSACTION_OUT){
+            auto parts=split_mouse_command(endpoint.profile,item.remaining);
+            if(!parts.empty())fusion_motion=parts.front();
+        }
+        fuse=compatible&&motion_fits(endpoint.profile,candidate,fusion_motion);
         buttons_only=compatible&&!item.buttons_committed&&
             (item.persistent!=endpoint.persistent_buttons||item.scheduled!=endpoint.scheduled_buttons||
-             item.kind==REPORT_RELEASE_ALL);
+             item.kind==REPORT_RELEASE_ALL||item.kind>=REPORT_TRANSACTION_OUT);
         if(physical.size()==1&&!fuse&&!buttons_only&&!endpoint.submitted_template.empty()&&
            endpoint.physical_successes_since_standalone>=3)standalone=competing=true;
     } else if(have_synthetic)standalone=true;
@@ -336,7 +357,7 @@ bool take_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
         uint8_t persistent=endpoint.persistent_buttons,scheduled=endpoint.scheduled_buttons;
         MouseCommand applied;
         if(have_synthetic&&compatible&&(fuse||buttons_only)) {
-            auto& item=endpoint.synthetic.front();if(fuse)applied=item.remaining;
+            auto& item=endpoint.synthetic.front();if(fuse)applied=fusion_motion;
             persistent=item.persistent;scheduled=item.scheduled;
             describe_synthetic(endpoint,item,io,applied,true,false,false);
         }
@@ -349,6 +370,7 @@ bool take_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
         return true;
     }
 
+    if(!have_synthetic)return false;
     auto& item=endpoint.synthetic.front();const auto& base=endpoint.submitted_template.empty()?endpoint.latest:endpoint.submitted_template;
     if(base.empty())return false;
     io={};io.inner.ep=endpoint.info->ep_num;io.inner.length=endpoint.profile.size;
@@ -364,7 +386,7 @@ bool take_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
 
 void notify_mouse_report_written(uint8_t address,const usb_raw_transfer_io& io,bool success) {
     if(!io.mouse_managed)return;
-    uint64_t written=monotonic_ns();bool emit=false;WriterEvent event;
+    uint64_t written=monotonic_ns();bool emit=false,finished=false;WriterEvent event;
     {
         std::lock_guard<std::mutex> lock(registry_mutex);auto found=endpoints.find(address);
         if(found==endpoints.end())return;
@@ -399,13 +421,15 @@ void notify_mouse_report_written(uint8_t address,const usb_raw_transfer_io& io,b
                 }
                 item.remaining.x-=io.synthetic_x;item.remaining.y-=io.synthetic_y;
                 item.remaining.wheel-=io.synthetic_wheel;item.remaining.pan-=io.synthetic_pan;
+                finished=no_motion(item.remaining)&&item.buttons_committed;
             }
             endpoint.inflight=false;endpoint.inflight_id=0;if(success)remove_finished_front(endpoint);else update_pending(endpoint);
         }
         if(current_layout&&(io.mouse_report_kind==REPORT_CLICK_PRESS||io.mouse_report_kind==REPORT_CLICK_RELEASE||
-           io.mouse_report_kind==REPORT_RELEASE_ALL||!success)) {
+           io.mouse_report_kind==REPORT_RELEASE_ALL||io.mouse_report_kind>=REPORT_TRANSACTION_OUT||!success)) {
             event={io.click_session,io.click_command,io.mouse_generation,written,io.click_index,
-                   io.mouse_report_kind,io.click_button,io.click_blocked,io.mouse_final_buttons,success};emit=true;
+                   io.mouse_report_kind,io.click_button,io.click_blocked,io.mouse_final_buttons,success};
+            event.dx=io.synthetic_x;event.dy=io.synthetic_y;event.finished=finished;emit=true;
         }
     }
     if(emit) {

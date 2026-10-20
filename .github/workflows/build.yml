@@ -1,28 +1,49 @@
 name: Build and test
 on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+concurrency:
+  group: usb-proxy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   linux:
-    runs-on: ubuntu-latest
+    name: Linux / ${{ matrix.compiler }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {compiler: GCC, cxx: g++}
+          - {compiler: Clang, cxx: clang++}
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libjsoncpp-dev
-      - run: make -j2
-      - name: Run tests
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install USB build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libjsoncpp-dev
+      - name: Build live proxy and standalone replay
+        run: make -j2 CXX=${{ matrix.cxx }}
+      - name: Protocol, mixer, transaction, UDP and Python client regressions
         shell: bash
         run: |
-          set +e
-          make test >test-output.log 2>&1
-          status=$?
-          cat test-output.log
-          if [ "$status" -ne 0 ]; then
-            message=$(tail -n 15 test-output.log)
-            message=${message//'%'/'%25'}
-            message=${message//$'\r'/'%0D'}
-            message=${message//$'\n'/'%0A'}
-            echo "::error title=make test failed::$message"
-          fi
-          exit "$status"
-      - name: HID parser sanitizers
+          set -o pipefail
+          make test CXX=${{ matrix.cxx }} 2>&1 | tee test-output.log
+      - name: HID parser and movement ledger sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
-          g++ -std=c++17 -g -fsanitize=address,undefined -fno-omit-frame-pointer -I. tests/protocol_test.cpp -o tests/protocol-test-sanitized
+          ${{ matrix.cxx }} -std=c++17 -g -fsanitize=address,undefined -fno-omit-frame-pointer -I. tests/protocol_test.cpp -o tests/protocol-test-sanitized
           ./tests/protocol-test-sanitized
+          ${{ matrix.cxx }} -std=c++17 -g -fsanitize=address,undefined -fno-omit-frame-pointer -DMOUSE_MIXER_TEST_STUBS -I. -Itests tests/mixer_test.cpp mouse_mixer.cpp -pthread -o tests/mixer-test-sanitized
+          ./tests/mixer-test-sanitized
+      - name: Keep build and transaction test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxy-${{ matrix.compiler }}-diagnostics
+          path: test-output.log
+          if-no-files-found: warn

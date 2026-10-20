@@ -4,6 +4,7 @@
 #include "host-raw-gadget.h"
 #endif
 #include "mouse_mixer.h"
+#include "move_executor.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -277,8 +278,50 @@ void cadence_fairness_and_residence(uint32_t poll_us) {
 }
 }
 
+void transaction_writer_accounting() {
+    using namespace move_protocol;
+    {
+        Fixture f;MoveExecutor engine;Request r;r.session=50;r.command=60;r.epoch=1;
+        r.generation=endpoint_snapshot().generation;r.dx=300;r.dy=-280;r.button=1;r.press_us=1000;
+        engine.start(r,endpoint_snapshot(),fake_now);int sumx=0,sumy=0,presses=0,releases=0;
+        for(int tick=0;tick<200&&engine.active();++tick){
+            assert(!engine.tick(endpoint_snapshot(),fake_now));usb_raw_transfer_io io{};
+            f.push_physical(0,0,0,0xa0); // Transactions use every idle physical report's axis capacity.
+            if(take_mouse_report(Fixture::address,io)){
+                sumx+=io.synthetic_x;sumy+=io.synthetic_y;
+                presses+=io.mouse_report_kind==REPORT_TRANSACTION_PRESS;
+                releases+=io.mouse_report_kind==REPORT_TRANSACTION_RELEASE;
+                f.complete(io);for(const auto& event:take_writer_events())engine.event(event);
+            }
+            fake_now+=1000000;
+        }
+        assert(engine.ack().status==Status::Completed&&sumx==0&&sumy==0&&presses==1&&releases==1);
+        assert(engine.ack().out_x==300&&engine.ack().return_x==-300&&(engine.ack().flags&6)==6);
+    }
+    {
+        Fixture f;MoveExecutor engine;Request r;r.session=51;r.command=61;r.epoch=1;
+        r.generation=endpoint_snapshot().generation;r.dx=300;
+        engine.start(r,endpoint_snapshot(),fake_now);engine.tick(endpoint_snapshot(),fake_now);
+        auto first=f.take();assert(first.synthetic_x==127);f.complete(first);
+        for(const auto& event:take_writer_events())engine.event(event);
+        assert(engine.ack().out_x==127&&engine.ack().residual_x==127);
+        auto second=f.take();f.complete(second,false);
+        for(const auto& event:take_writer_events())engine.event(event);
+        assert(engine.ack().status==Status::WriterFailed&&engine.ack().out_x==127&&(engine.ack().flags&1));
+    }
+    {
+        Fixture f;MoveExecutor engine;Request r;r.session=52;r.command=62;r.epoch=1;r.dx=10;
+        r.generation=endpoint_snapshot().generation;
+        engine.start(r,endpoint_snapshot(),fake_now);engine.tick(endpoint_snapshot(),fake_now);
+        f.push_physical(0,5,0,0xa0);auto io=f.take();assert(io.mouse_physical&&io.synthetic_x==0);f.complete(io);
+        assert(engine.tick(endpoint_snapshot(),fake_now)&&engine.ack().status==Status::Interrupted);
+        assert(engine.ack().out_x==0); // Genuine physical motion never enters the inverse ledger.
+    }
+}
+
 int main() {
     set_mouse_mixer_clock_for_test(fake_clock);
+    transaction_writer_accounting();
     physical_order_and_fusion();independent_button_masks_and_edges();
     overflow_supersession_failure_and_capacity();supersession_barriers();
     bounded_queue_and_cleanup();physical_completion_survives_synthetic_reset();
