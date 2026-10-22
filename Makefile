@@ -42,7 +42,7 @@ test:
 	./tests/udp-test
 	$(CXX) -std=c++17 -Wall -Wextra -I. tests/replay_test.cpp usb_capture.cpp -pthread -ljsoncpp -o tests/replay-test
 	./tests/replay-test
-	python3 -m unittest discover -s tests -p 'test_*.py'
+	CXX="$(CXX)" python3 -m unittest discover -s tests -p 'test_*.py'
 
 -include $(wildcard *.d)
 

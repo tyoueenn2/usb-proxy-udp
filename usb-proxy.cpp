@@ -1,3 +1,4 @@
+#include "usb_measurement.h"
 #include "host-raw-gadget.h"
 #include "device-libusb.h"
 #include "proxy.h"
@@ -164,6 +165,7 @@ int setup_host_usb_desc() {
 
 int main(int argc, char **argv)
 {
+    (void)usb_measurement();
 	const char *device = "dummy_udc.0";
 	const char *driver = "dummy_udc";
 	int vendor_id = -1;

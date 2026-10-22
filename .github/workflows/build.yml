@@ -8,6 +8,9 @@ concurrency:
 
 jobs:
   linux:
+    env:
+      CXX: ${{ matrix.cxx }}
+      USB_PROXY_MEASUREMENT_TEST_DIR: ${{ github.workspace }}/test-results/measurements
     name: Linux / ${{ matrix.compiler }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -26,7 +29,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libjsoncpp-dev
       - name: Build live proxy and standalone replay
         run: make -j2 CXX=${{ matrix.cxx }}
-      - name: Protocol, mixer, transaction, UDP and Python client regressions
+      - name: Protocol, mixer, transaction, measurement logger and Python client regressions
         shell: bash
         run: |
           set -o pipefail
@@ -45,5 +48,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: proxy-${{ matrix.compiler }}-diagnostics
-          path: test-output.log
+          path: |
+            test-output.log
+            test-results/measurements/**/*.jsonl
           if-no-files-found: warn

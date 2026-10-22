@@ -422,3 +422,26 @@ writer failure, layout change and shutdown stop further transaction movement and
 leave the existing final-release obligation active. They may report a residual or
 uncertain return. Never treat writer completion as observed desktop position or
 replay displacement after an endpoint change.
+
+### Optional transaction write measurements
+
+Set `USB_PROXY_MEASUREMENT_LOG=/absolute/path/pi.jsonl` before starting the live
+proxy or replay binary. For sudo, use `sudo env USB_PROXY_MEASUREMENT_LOG=...`.
+This enables a bounded background JSONL logger. Each move/action/return USB write
+records session/command/generation, report kind, attempted counts, result, errno,
+and the Pi monotonic duration around the write syscall. No wire format changes.
+The duration includes kernel blocking/scheduling and is not bus latency or proof
+that Windows processed the click. Failed write counts are not committed movement.
+
+Use a separate file per process. Normal shutdown emits `log_end` with dropped-event
+count; discard incomplete/dropped/error runs. Logging adds small serialization and
+locking overhead even though file IO is off the USB writer thread. Record hardware,
+software revisions, endpoint interval and enabled/disabled timing comparisons.
+Analyze together with Receiver JSONL using Receiver's
+`tools/analyze_move_measurements.py`; see its `docs/technical/MEASUREMENT.md` for
+schema, clock-domain rules and the application-side click observer.
+
+GitHub Actions runs the measurement serializer/flush regression with both GCC and
+Clang as part of `make test`. Synthetic measurement JSONL is retained in the
+`proxy-<compiler>-diagnostics` artifact. Set `USB_PROXY_MEASUREMENT_TEST_DIR` to
+retain these fixtures locally. This does not execute a real USB write.

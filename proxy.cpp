@@ -1,3 +1,4 @@
+#include "usb_measurement.h"
 #include <vector>
 
 #include "host-raw-gadget.h"
@@ -148,9 +149,15 @@ void *ep_loop_write(void *arg) {
 			printData(io, ep.bEndpointAddress, transfer_type, dir);
 
 		if (ep.bEndpointAddress & USB_DIR_IN) {
+			const auto measurement_start = usb_measurement().enabled() ? measurement::now_ns() : 0;
 			int rv = usb_raw_ep_write(fd, (struct usb_raw_ep_io *)&io);
+			const int write_errno = rv < 0 ? errno : 0;
+			const auto measurement_end = usb_measurement().enabled() ? measurement::now_ns() : 0;
 			if (managed_mouse)
 				notify_mouse_report_written(ep.bEndpointAddress, io, rv == int(io.inner.length));
+			measure_usb_write(io, measurement_start, measurement_end, rv, write_errno);
+			if (rv < 0)
+				errno = write_errno;
 			if (rv < 0 && errno == ESHUTDOWN) {
 				printf("EP%x(%s_%s): device likely reset, stopping thread\n",
 					ep.bEndpointAddress, transfer_type.c_str(), dir.c_str());

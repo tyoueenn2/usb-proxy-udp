@@ -1,3 +1,4 @@
+#include "usb_measurement.h"
 #include "host-raw-gadget.h"
 #include "udp_server.h"
 #include "replay_profile.h"
@@ -39,9 +40,15 @@ void write_endpoint(Endpoint* e) {
             } else {io=e->queue.front();e->queue.pop_front();}
         }
         e->cond.notify_all();
+        const auto measurement_start = usb_measurement().enabled() ? measurement::now_ns() : 0;
         int result=usb_raw_ep_write(e->info.fd,&io.inner);
+        const int write_errno = result < 0 ? errno : 0;
+        const auto measurement_end = usb_measurement().enabled() ? measurement::now_ns() : 0;
+
         if(e->mouse&&!timed)
             notify_mouse_report_written(e->info.endpoint.bEndpointAddress,io,result==int(io.inner.length));
+        measure_usb_write(io, measurement_start, measurement_end, result, write_errno);
+        if (result < 0) errno = write_errno;
         if(result<0)break;
         std::lock_guard<std::mutex> lock(e->mutex);
         e->last=io;
@@ -59,6 +66,7 @@ void read_endpoint(Endpoint* e) {
 }
 
 int main(int argc,char** argv) {
+    (void)usb_measurement();
     if(argc<2) {fprintf(stderr,"Usage: usb-replay capture.jsonl [--check | UDC_NAME UDC_DRIVER]\n");return 1;}
     try {
         auto profile=ReplayProfile::load(argv[1]);
