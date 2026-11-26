@@ -31,7 +31,7 @@ struct EndpointSnapshot {
     uint32_t poll_us=1000,physical_age_us=0xffffffffu;
     uint32_t physical_received=0,physical_submitted=0,superseded=0,writer_failures=0;
     uint16_t output_queue=0,synthetic_pending=0;
-    uint64_t generation=0,snapshot_ns=0,last_motion_ns=0,p99_residence_ns=0,activity=0,layout=0;
+    uint64_t generation=0,snapshot_ns=0,last_motion_ns=0,activity=0,layout=0;
     int64_t cumulative_x=0,cumulative_y=0;
 };
 
@@ -57,6 +57,7 @@ void notify_mouse_report_written(uint8_t endpoint,const usb_raw_transfer_io& io,
 std::shared_ptr<const std::function<void()>> subscribe_mouse_scheduler(std::function<void()> wake);
 
 EndpointSnapshot endpoint_snapshot();
+uint64_t mouse_residence_p99_ns();
 std::string mouse_state_text();
 EnqueueResult enqueue_report(MouseCommand command,uint8_t persistent,uint8_t scheduled,
                              ReportKind kind,bool latest,uint64_t session=0,uint64_t command_id=0,

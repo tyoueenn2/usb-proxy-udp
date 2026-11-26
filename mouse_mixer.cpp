@@ -58,6 +58,8 @@ struct Endpoint {
     thread_info* info=nullptr;
     int interface_number=0;
     MouseProfile profile;
+    uint64_t layout=0;
+    uint8_t supported=0;
     std::vector<uint8_t> latest,submitted_template;
     std::deque<SyntheticItem> synthetic;
     std::deque<uint64_t> residence_ns;
@@ -107,11 +109,30 @@ void update_pending(Endpoint& endpoint) {
     if(endpoint.info&&endpoint.info->mouse_synthetic_pending)
         endpoint.info->mouse_synthetic_pending->store(!endpoint.synthetic.empty(),std::memory_order_release);
 }
+void cache_layout(Endpoint& endpoint,const MouseProfile& profile) {
+    // Stable layout fingerprint, independent of process/generation numbers.
+    uint64_t layout=1469598103934665603ull;
+    auto hash=[&](uint64_t n){for(int i=0;i<8;++i){layout^=uint8_t(n);layout*=1099511628211ull;n>>=8;}};
+    hash(profile.id);hash(profile.size);
+    auto field=[&](const HidField& f){hash(f.offset);hash(f.bits);hash(uint32_t(f.minimum));hash(uint32_t(f.maximum));};
+    field(profile.x);field(profile.y);field(profile.wheel);field(profile.pan);
+    for(const auto& b:profile.buttons){hash(b.first);field(b.second);}
+    endpoint.layout=layout?layout:1;
+    endpoint.supported=0;
+    for(const auto& button:profile.buttons)
+        endpoint.supported|=uint8_t(1u<<(button.first-1));
+}
+
 MouseProfile* matching_profile(Endpoint& endpoint,const uint8_t* data,size_t size) {
-    for(auto& profile:descriptors[endpoint.interface_number])
-        if(profile.matches(data,size)&&(endpoint.latest.empty()||profile.id==endpoint.profile.id))return &profile;
+    for(auto& profile:descriptors[endpoint.interface_number]) {
+        if(profile.matches(data,size)&&(endpoint.latest.empty()||profile.id==endpoint.profile.id)) {
+            if(!endpoint.layout)cache_layout(endpoint,profile);
+            return &profile;
+        }
+    }
     return nullptr;
 }
+
 bool field_fits(const HidField& field,int physical,int synthetic) {
     if(!synthetic)return true;
     if(!field.bits)return false;
@@ -177,6 +198,7 @@ void invalidate_interface(int number) {
     for(auto& pair:endpoints)if(pair.second.interface_number==number) {
         auto& endpoint=pair.second;
         endpoint.latest.clear();endpoint.submitted_template.clear();endpoint.synthetic.clear();
+        endpoint.layout=0;endpoint.supported=0;
         endpoint.persistent_buttons=endpoint.scheduled_buttons=0;
         endpoint.inflight=false;endpoint.inflight_id=0;endpoint.generation=++next_generation;
         update_pending(endpoint);if(endpoint.info)endpoint.info->data_cond->notify_all();
@@ -278,14 +300,7 @@ EndpointSnapshot endpoint_snapshot() {
     snapshot.persistent=endpoint.persistent_buttons;snapshot.scheduled=endpoint.scheduled_buttons;
     snapshot.xmin=endpoint.profile.x.minimum;snapshot.xmax=endpoint.profile.x.maximum;
     snapshot.activity=endpoint.activity;
-    // Stable layout fingerprint, independent of process/generation numbers.
-    uint64_t layout=1469598103934665603ull;
-    auto hash=[&](uint64_t n){for(int i=0;i<8;++i){layout^=uint8_t(n);layout*=1099511628211ull;n>>=8;}};
-    hash(endpoint.profile.id);hash(endpoint.profile.size);
-    auto field=[&](const HidField& f){hash(f.offset);hash(f.bits);hash(uint32_t(f.minimum));hash(uint32_t(f.maximum));};
-    field(endpoint.profile.x);field(endpoint.profile.y);field(endpoint.profile.wheel);field(endpoint.profile.pan);
-    for(const auto& b:endpoint.profile.buttons){hash(b.first);field(b.second);}
-    snapshot.layout=layout?layout:1;
+    snapshot.layout=endpoint.layout;snapshot.supported=endpoint.supported;
     snapshot.ymin=endpoint.profile.y.minimum;snapshot.ymax=endpoint.profile.y.maximum;
     snapshot.physical_dx=endpoint.physical_dx;snapshot.physical_dy=endpoint.physical_dy;
     snapshot.poll_us=std::max<uint32_t>(1,endpoint.info->mouse_poll_interval_us);snapshot.generation=endpoint.generation;
@@ -296,17 +311,28 @@ EndpointSnapshot endpoint_snapshot() {
     snapshot.cumulative_y=endpoint.cumulative_y;snapshot.last_motion_ns=endpoint.last_motion_ns;
     if(endpoint.last_motion_ns&&snapshot.snapshot_ns>=endpoint.last_motion_ns)
         snapshot.physical_age_us=saturate32((snapshot.snapshot_ns-endpoint.last_motion_ns)/1000);
-    for(const auto& button:endpoint.profile.buttons)snapshot.supported|=uint8_t(1u<<(button.first-1));
     if(endpoint.info&&endpoint.info->data_queue&&endpoint.info->data_mutex) {
         std::lock_guard<std::mutex> queue_lock(*endpoint.info->data_mutex);
         snapshot.output_queue=saturate16(endpoint.info->data_queue->size());
     }
-    if(!endpoint.residence_ns.empty()) {
-        std::vector<uint64_t> samples(endpoint.residence_ns.begin(),endpoint.residence_ns.end());
-        size_t index=(samples.size()*99+99)/100-1;std::nth_element(samples.begin(),samples.begin()+index,samples.end());
-        snapshot.p99_residence_ns=samples[index];
-    }
     return snapshot;
+}
+
+uint64_t mouse_residence_p99_ns() {
+    std::array<uint64_t,MAX_RESIDENCE_SAMPLES> samples;
+    size_t count;
+    {
+        std::lock_guard<std::mutex> lock(registry_mutex);
+        const auto found=endpoints.find(selected);
+        if(found==endpoints.end()||found->second.latest.empty())return 0;
+        const auto& history=found->second.residence_ns;
+        count=history.size();
+        std::copy(history.begin(),history.end(),samples.begin());
+    }
+    if(!count)return 0;
+    const size_t index=(count*99+99)/100-1;
+    std::nth_element(samples.begin(),samples.begin()+index,samples.begin()+count);
+    return samples[index];
 }
 
 std::string mouse_state_text() {

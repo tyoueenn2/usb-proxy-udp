@@ -275,9 +275,32 @@ void cadence_fairness_and_residence(uint32_t poll_us) {
         f.complete(io,true,uint64_t(poll_us)*1000);
     }
     assert(standalone_outputs<=4&&physical_outputs>=12);
-    auto s=endpoint_snapshot();assert(s.p99_residence_ns<=uint64_t(poll_us)*2000);
+    auto s=endpoint_snapshot();assert(mouse_residence_p99_ns()<=uint64_t(poll_us)*2000);
     assert(s.physical_submitted+f.physical_queue.size()==f.received);
 }
+}
+
+void cached_layout_and_residence() {
+    Fixture f;
+    const auto report=endpoint_snapshot();
+    assert(report.ready&&report.supported==0x1f&&report.layout);
+    for(uint64_t ns:{100,300,200}) {
+        f.push_physical(0,0,0,0xa0);f.complete(f.take(),true,ns);
+    }
+    assert(mouse_residence_p99_ns()==300);
+    assert(endpoint_snapshot().layout==report.layout);
+    set_mouse_protocol(7,true);
+    const auto invalidated=endpoint_snapshot();
+    assert(!invalidated.ready&&!invalidated.layout&&!invalidated.supported);
+    assert(mouse_residence_p99_ns()==0);
+    usb_raw_transfer_io boot{};boot.inner.length=3;
+    seed_mouse_report(Fixture::address,boot);
+    const auto seeded=endpoint_snapshot();
+    assert(seeded.ready&&seeded.supported==7&&seeded.layout&&seeded.layout!=report.layout);
+    set_mouse_protocol(7,false);
+    f.push_physical(0,0,0,0xa0);
+    const auto restored=endpoint_snapshot();
+    assert(restored.ready&&restored.layout==report.layout&&restored.supported==report.supported);
 }
 
 void transaction_writer_accounting() {
@@ -392,6 +415,7 @@ int main() {
     bounded_queue_and_cleanup();physical_completion_survives_synthetic_reset();
     physical_completion_survives_layout_change();stale_endpoint_completion_is_ignored();
     bounded_completion_events();
+    cached_layout_and_residence();
     cadence_fairness_and_residence(8000);cadence_fairness_and_residence(1000);cadence_fairness_and_residence(125);
     set_mouse_mixer_clock_for_test(nullptr);
     std::cout<<"Mixer ordering, fusion, masks, overflow, retries, bounds, fairness and fake cadences passed\n";
