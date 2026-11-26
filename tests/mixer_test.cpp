@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <vector>
@@ -432,27 +433,42 @@ void physical_report_history() {
     set_mouse_protocol(7, false);
 }
 
-void guarded_assistance_follows_the_live_hand() {
+void steering_rotates_the_physical_report() {
     Fixture f;
-    MouseCommand assist;assist.x=3;
-    assert(enqueue_report(assist,0,0,REPORT_HAND_ASSIST,true)==EnqueueResult::NotReady);
-    f.push_physical(0,5,0,0xa0);f.complete(f.take());
-    f.enqueue(assist,0,0,REPORT_HAND_ASSIST,true);
-    auto first=f.take();
-    assert(first.synthetic_x==3&&first.mouse_report_kind==REPORT_HAND_ASSIST);
-    f.complete(first);
-    f.enqueue(assist,0,0,REPORT_HAND_ASSIST,true);
+    auto physical=[&](int x,int y,uint8_t buttons=0) {
+        f.push_physical(buttons,x,y,0xa0);
+        auto io=f.take();
+        assert(io.mouse_physical&&io.synthetic_item_id==0);
+        assert(io.physical_x==x&&io.physical_y==y&&Fixture::buttons(io)==buttons);
+        f.complete(io);
+        return std::pair<int,int>{Fixture::x(io),Fixture::y(io)};
+    };
+    mouse_history::Steering plan;
+    plan.session=1;plan.token=2;plan.epoch=3;plan.generation=endpoint_snapshot().generation;
+    plan.angle_cdeg=500;plan.aim={10000,0};plan.tangent={9000,1000};
+    auto update_plan=[&] {
+        plan.sample_ms=fake_now/mouse_history::tick_ns;
+        plan.expires_ms=plan.sample_ms+20;
+        assert(set_mouse_steering(plan));
+    };
+    physical(100,0);
+    update_plan();
+    auto bent=physical(100,0,2);
+    assert(bent.second>0&&bent.second<=9);
+    assert(std::abs(std::hypot(bent.first,bent.second)-100)<=.71);
+    assert((physical(0,0,2)==std::pair<int,int>{0,0}));
+    assert((physical(100,10,2)==std::pair<int,int>{100,10}));
+    assert((physical(100,0,2)==std::pair<int,int>{100,0}));
+    assert(!set_mouse_steering(plan)); // A request based on data before the turn is stale.
     fake_now+=1000000;
-    f.push_physical(0,-5,0,0xa0);
-    auto reversed=f.take();
-    assert(reversed.mouse_physical&&reversed.synthetic_x==0&&Fixture::x(reversed)==-5);
-    f.complete(reversed);
-    assist.x=-3;
-    f.enqueue(assist,0,0,REPORT_HAND_ASSIST,true);
-    fake_now+=7000000;
-    usb_raw_transfer_io quiet{};
-    assert(!take_mouse_report(Fixture::address,quiet));
-    assert(endpoint_snapshot().synthetic_pending==0);
+    physical(100,0);
+    update_plan();
+    fake_now+=21000000;
+    assert((physical(100,0)==std::pair<int,int>{100,0}));
+    update_plan();
+    plan.angle_cdeg=0;
+    assert(set_mouse_steering(plan));
+    assert((physical(100,0)==std::pair<int,int>{100,0}));
 }
 
 int main() {
@@ -466,7 +482,7 @@ int main() {
     bounded_completion_events();
     cached_layout_and_residence();
     physical_report_history();
-    guarded_assistance_follows_the_live_hand();
+    steering_rotates_the_physical_report();
     cadence_fairness_and_residence(8000);cadence_fairness_and_residence(1000);cadence_fairness_and_residence(125);
     set_mouse_mixer_clock_for_test(nullptr);
     std::cout<<"Mixer ordering, fusion, masks, overflow, retries, bounds, fairness and fake cadences passed\n";

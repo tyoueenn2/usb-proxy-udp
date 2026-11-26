@@ -17,7 +17,6 @@ enum ReportKind:uint8_t {
     REPORT_CLICK_PRESS,
     REPORT_CLICK_RELEASE,
     REPORT_RELEASE_ALL,
-    REPORT_HAND_ASSIST,
     REPORT_TRANSACTION_OUT,
     REPORT_TRANSACTION_PRESS,
     REPORT_TRANSACTION_RELEASE,
@@ -60,6 +59,8 @@ std::shared_ptr<const std::function<void()>> subscribe_mouse_scheduler(std::func
 
 EndpointSnapshot endpoint_snapshot();
 bool physical_mouse_history(mouse_history::Reply& reply);
+bool set_mouse_steering(const mouse_history::Steering& plan);
+void clear_mouse_steering();
 uint64_t mouse_residence_p99_ns();
 std::string mouse_state_text();
 EnqueueResult enqueue_report(MouseCommand command,uint8_t persistent,uint8_t scheduled,

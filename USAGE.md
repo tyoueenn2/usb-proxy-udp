@@ -57,7 +57,7 @@ with MouseProxy('192.168.1.20') as mouse:
 | 12 | 1 | Signed wheel |
 | 13 | 1 | Signed horizontal pan |
 | 14 | 1 | Complete persistent injected button mask |
-| 15 | 1 | Zero for ordinary movement, 1 for hand-guarded movement |
+| 15 | 1 | Reserved; must be zero |
 
 Python encoding:
 
@@ -440,9 +440,23 @@ milliseconds as five unsigned big-endian 64-bit values. The payload contains
 containing the end time is still open and excluded. A history query has no
 effect on the controller lease or telemetry renewal.
 
-The live history client can set byte 15 of an UPX1 movement packet to 1.
-The proxy accepts this form from the active UPT3 subscriber when its button
-snapshot matches the existing synthetic button state and wheel and pan are
-zero. The mixer checks that it follows fresh physical movement, both on
-enqueue and before preparing the HID write. Queued assistance expires after
-6 ms. Legacy proxy versions ignore this optional form.
+### Live movement steering
+
+`UPJ1` sets a short-lived direction for physical XY reports. Only the active
+UPT3 subscriber may send it. The proxy verifies the server epoch and endpoint
+generation, and rejects replayed sequence tokens. A steering update renews
+the controller lease only when the proxy can use it.
+
+The 64-byte network-order packet starts with `UPJ1`, a 16-bit angle in
+hundredths of a degree, and two reserved zero bytes. It then carries six
+unsigned 64-bit values in order: session, sequence token, epoch, generation,
+history end time in monotonic milliseconds, and expiry time in the same clock.
+Four signed 16-bit values encode aim X/Y and desired tangent X/Y as direction
+components scaled by 10,000. The permitted angle is 0.50–30.00 degrees. To
+cancel, set the angle, both timestamps, and all direction components to zero.
+
+The expiry may be at most 20 ms after the history end time. The mixer checks
+the original physical direction before steering each report, cancels when
+the hand leaves the configured angle, and passes the out-of-cone report
+through. It preserves report count, output pacing, wheel, and physical buttons.
+Synthetic output takes priority over steering when present.
