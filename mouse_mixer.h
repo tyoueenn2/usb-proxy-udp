@@ -1,6 +1,8 @@
 #pragma once
 #include "mouse_protocol.h"
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -50,6 +52,9 @@ void queue_physical_mouse_report(uint8_t endpoint,usb_raw_transfer_io& io);
 void seed_mouse_report(uint8_t endpoint,usb_raw_transfer_io& io);
 bool take_mouse_report(uint8_t endpoint,usb_raw_transfer_io& io);
 void notify_mouse_report_written(uint8_t endpoint,const usb_raw_transfer_io& io,bool success);
+
+// The UDP scheduler is the sole consumer of writer events. The token owns its wake callback.
+std::shared_ptr<const std::function<void()>> subscribe_mouse_scheduler(std::function<void()> wake);
 
 EndpointSnapshot endpoint_snapshot();
 std::string mouse_state_text();

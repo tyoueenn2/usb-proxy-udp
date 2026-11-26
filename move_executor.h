@@ -7,7 +7,7 @@
 class MoveExecutor {
     move_protocol::Request request_{};
     move_protocol::Ack ack_{};
-    uint64_t due_ = 0, deadline_ = 0, activity_ = 0;
+    uint64_t due_ = 0, deadline_ = 0, activity_ = 0, retry_at_ = 0;
     bool pending_ = false, continued_ = false, cancelled_ = false;
     void stage(move_protocol::Stage value, uint64_t now) {
         ack_.stage = value;
@@ -18,6 +18,29 @@ class MoveExecutor {
     bool active() const {
         return ack_.status == move_protocol::Status::Active || ack_.status == move_protocol::Status::Accepted;
     }
+    uint64_t next_deadline(uint64_t now) const {
+        using move_protocol::Stage;
+        if (!active())
+            return UINT64_MAX;
+        if (pending_)
+            return deadline_;
+        if (retry_at_)
+            return std::min(deadline_, retry_at_);
+        if (cancelled_ && ack_.stage != Stage::Return)
+            return now;
+        switch (ack_.stage) {
+        case Stage::Waiting:
+            return std::min(deadline_, continued_ ? now : due_);
+        case Stage::Settle:
+        case Stage::Hold:
+        case Stage::Delay:
+            return std::min(deadline_, due_);
+        default:
+            return now;
+        }
+    }
+    void writer_progress() { retry_at_ = 0; }
+
     const move_protocol::Ack& ack() const {
         return ack_;
     }
@@ -34,6 +57,7 @@ class MoveExecutor {
         pending_ = continued_ = cancelled_ = false;
         deadline_ = now + uint64_t(r.budget_us) * 1000;
         due_ = now;
+        retry_at_ = 0;
         activity_ = e.activity;
     }
     void stop(move_protocol::Status reason, uint64_t now) {
@@ -50,8 +74,10 @@ class MoveExecutor {
             continued_ = true;
     }
     void cancel() {
-        if (active())
+        if (active() && !cancelled_) {
             cancelled_ = true;
+            retry_at_ = 0;
+        }
     }
     void event(const WriterEvent& e) {
         using namespace move_protocol;
@@ -113,8 +139,9 @@ class MoveExecutor {
             stop(Status::Timeout, now);
             return true;
         }
-        if (pending_)
+        if (pending_ || now < retry_at_)
             return false;
+        retry_at_ = 0;
         if (cancelled_ && ack_.stage != Stage::Return) {
             if ((ack_.flags & 2) && !(ack_.flags & 4))
                 stage(Stage::Release, now);
@@ -191,7 +218,9 @@ class MoveExecutor {
                            request_.button, activity_, request_.generation);
         if (result == EnqueueResult::Ok)
             pending_ = true;
-        else if (result != EnqueueResult::QueueFull) {
+        else if (result == EnqueueResult::QueueFull)
+            retry_at_ = now + uint64_t(e.poll_us) * 1000;
+        else {
             stop(Status::EndpointChanged, now);
             return true;
         }

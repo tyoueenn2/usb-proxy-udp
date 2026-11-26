@@ -2,6 +2,7 @@
 #include "click_protocol.h"
 #include "move_executor.h"
 #include "session_tracker.h"
+#include "scheduler_wait.h"
 #include "telemetry_protocol.h"
 #include "upx_replay.h"
 #include <arpa/inet.h>
@@ -58,12 +59,34 @@ bool UdpServer::start() {
        bind(sockfd,reinterpret_cast<sockaddr*>(&address),sizeof(address))<0) {
         perror("UDP bind");close(sockfd);sockfd=-1;return false;
     }
-    running=true;server_thread=std::thread(&UdpServer::server_loop,this);return true;
+    auto wake=std::make_shared<SchedulerEvent>();
+    auto timer=std::make_unique<SchedulerTimer>();
+    if(wake->fd()<0||timer->fd()<0) {
+        perror("UDP scheduler fd");close(sockfd);sockfd=-1;return false;
+    }
+    wake_=std::move(wake);
+    running=true;
+    try {
+        server_thread=std::thread([this,timer=std::move(timer)]{server_loop(*timer);});
+    } catch(...) {
+        stop();
+        throw;
+    }
+    return true;
 }
-void UdpServer::stop(){running=false;join();if(sockfd>=0){close(sockfd);sockfd=-1;}}
+void UdpServer::stop(){
+    running=false;
+    if(wake_)wake_->signal();
+    join();
+    wake_.reset();
+    if(sockfd>=0){close(sockfd);sockfd=-1;}
+}
 void UdpServer::join(){if(server_thread.joinable())server_thread.join();}
 
-void UdpServer::server_loop() {
+void UdpServer::server_loop(SchedulerTimer& timer) {
+    auto wake=wake_;
+    auto mixer_subscription=subscribe_mouse_scheduler([wake]{wake->signal();});
+    uint64_t click_retry=0;
     const uint64_t server_epoch=random_epoch();
     uint8_t persistent_buttons=0,scheduled_buttons=0;uint64_t tracked_generation=0;
     sockaddr_in owner{};bool owned=false;
@@ -117,8 +140,7 @@ void UdpServer::server_loop() {
         mover.stop(move_protocol::Status::Cancelled,now_ns());sync_move();
         if(attach_release&&release_key.session&&!(release_key==key))
             terminal(release_key,click_protocol::Status::Cancelled);
-        mover.stop(move_protocol::Status::Cancelled,now_ns());sync_move();
-    cancel_work();persistent_buttons=scheduled_buttons=0;
+        cancel_work();persistent_buttons=scheduled_buttons=0;click_retry=0;
         auto cleared=clear_synthetic_state();tracked_generation=cleared.generation;
         // Release is an obligation, not a one-shot enqueue. Temporary endpoint
         // loss, layout changes, watchdog cleanup and writer failures leave it
@@ -147,32 +169,46 @@ void UdpServer::server_loop() {
         if(work.empty())return;auto click=work.front();work.pop_front();scheduled_buttons=0;
         if(click.binary)terminal(click.key,status);
     };
-    auto scheduler_tick=[&](uint64_t now) {
-        if(release_pending&&!release_inflight) {
-            MouseCommand release;
-            auto result=enqueue_report(release,0,0,REPORT_RELEASE_ALL,false,release_key.session,release_key.command);
+    auto click_deadline=[&](const EndpointSnapshot& endpoint,uint64_t now) -> uint64_t {
+        if(release_pending)
+            return endpoint.ready&&!release_inflight?std::max(now,click_retry):UINT64_MAX;
+        if(work.empty())return UINT64_MAX;
+        const auto& click=work.front();
+        if(click.phase==ClickPhase::PressInflight||click.phase==ClickPhase::ReleaseInflight)return UINT64_MAX;
+        return std::max(click.due_ns,click_retry);
+    };
+    auto scheduler_tick=[&](const EndpointSnapshot& endpoint,uint64_t now) {
+        if(now<click_deadline(endpoint,now))return;
+        click_retry=0;
+        auto retry=[&](EnqueueResult result) {
+            if(result==EnqueueResult::Unsupported)begin_reset(false,{});
+            else if(result!=EnqueueResult::Ok)click_retry=now+uint64_t(endpoint.poll_us)*1000;
+        };
+        if(release_pending) {
+            auto result=enqueue_report(MouseCommand{},0,0,REPORT_RELEASE_ALL,false,release_key.session,
+                                       release_key.command,0,0,UINT64_MAX,endpoint.generation);
             if(result==EnqueueResult::Ok)release_inflight=true;
+            else click_retry=now+uint64_t(endpoint.poll_us)*1000;
+            return;
         }
-        if(work.empty()||release_pending)return;
         auto& click=work.front();uint8_t bit=uint8_t(1u<<(click.button-1));
-        if(click.phase==ClickPhase::AwaitPress&&now>=click.due_ns) {
-            auto snapshot=endpoint_snapshot();
-            if(!snapshot.ready||snapshot.generation!=tracked_generation){begin_reset(false,{});return;}
-            if((snapshot.physical|persistent_buttons|scheduled_buttons)&bit){finish_front(click_protocol::Status::ButtonActive);return;}
-            MouseCommand edge;uint8_t next=scheduled_buttons|bit;
-            auto result=enqueue_report(edge,persistent_buttons,next,REPORT_CLICK_PRESS,false,
-                                       click.key.session,click.key.command,click.index,click.button);
+        if(click.phase==ClickPhase::AwaitPress) {
+            if(!endpoint.ready||endpoint.generation!=tracked_generation){begin_reset(false,{});return;}
+            if((endpoint.physical|persistent_buttons|scheduled_buttons)&bit){finish_front(click_protocol::Status::ButtonActive);return;}
+            uint8_t next=scheduled_buttons|bit;
+            auto result=enqueue_report(MouseCommand{},persistent_buttons,next,REPORT_CLICK_PRESS,false,
+                                       click.key.session,click.key.command,click.index,click.button,UINT64_MAX,endpoint.generation);
             if(result==EnqueueResult::Ok){scheduled_buttons=next;click.phase=ClickPhase::PressInflight;}
-            else if(result==EnqueueResult::Unsupported)begin_reset(false,{});
-        } else if((click.phase==ClickPhase::Holding||click.phase==ClickPhase::AwaitRelease)&&now>=click.due_ns) {
-            MouseCommand edge;uint8_t next=scheduled_buttons&~bit;
-            auto result=enqueue_report(edge,persistent_buttons,next,REPORT_CLICK_RELEASE,false,
-                                       click.key.session,click.key.command,click.index,click.button);
+            else retry(result);
+        } else {
+            uint8_t next=scheduled_buttons&~bit;
+            auto result=enqueue_report(MouseCommand{},persistent_buttons,next,REPORT_CLICK_RELEASE,false,
+                                       click.key.session,click.key.command,click.index,click.button,UINT64_MAX,endpoint.generation);
             if(result==EnqueueResult::Ok){scheduled_buttons=next;click.phase=ClickPhase::ReleaseInflight;}
-            else if(result==EnqueueResult::Unsupported)begin_reset(false,{});
-            else click.phase=ClickPhase::AwaitRelease;
+            else retry(result);
         }
     };
+
     auto process_writer_events=[&]() {
         for(const auto& event:take_writer_events()) {
             mover.event(event);sync_move();
@@ -180,7 +216,7 @@ void UdpServer::server_loop() {
                 begin_reset(false,{});owned=false;
                 continue;
             }
-            if(event.kind==REPORT_RELEASE_ALL&&release_inflight&&event.session==release_key.session&&event.command==release_key.command) {
+            if(event.kind==REPORT_RELEASE_ALL&&event.finished&&release_inflight&&event.session==release_key.session&&event.command==release_key.command) {
                 release_inflight=false;
                 release_pending=false;if(release_key.session)terminal(release_key,click_protocol::Status::Completed);release_key={};
                 continue;
@@ -207,6 +243,7 @@ void UdpServer::server_loop() {
         }
     };
 
+    bool udp_ready=false;
     while(running) {
         auto snapshot=endpoint_snapshot();
         if(!tracked_generation&&snapshot.ready)tracked_generation=snapshot.generation;
@@ -218,13 +255,20 @@ void UdpServer::server_loop() {
         if(take_writer_overflow()) {
             begin_reset(false,{});owned=false;
         }
-        auto now=Clock::now();
-        if(owned&&now-last>std::chrono::milliseconds(250)) {
+        const auto watchdog_deadline=owned
+            ? uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(last.time_since_epoch()).count())+250000000
+            : UINT64_MAX;
+        if(now_ns()>=watchdog_deadline) {
             begin_reset(false,{});owned=false;
         }
-        if(mover.tick(endpoint_snapshot(),now_ns())){sync_move();begin_reset(false,{});}
-        sync_move();
-        scheduler_tick(now_ns());
+        for(unsigned transition=0;transition<8&&running;++transition) {
+            const auto now=now_ns();
+            snapshot=endpoint_snapshot();
+            if(mover.tick(snapshot,now)){sync_move();begin_reset(false,{});}
+            sync_move();
+            scheduler_tick(snapshot,now);
+            if(std::min(mover.next_deadline(now),click_deadline(snapshot,now))>now)break;
+        }
 
         auto telemetry_now=now_ns();
         if(subscription.alive(telemetry_now)) {
@@ -246,9 +290,34 @@ void UdpServer::server_loop() {
             }
         }
 
-        pollfd poller{sockfd,POLLIN,0};if(poll(&poller,1,mover.active()?1:2)<=0)continue;
+        const auto deadline_now=now_ns();
+        auto deadline=std::min(mover.next_deadline(deadline_now),click_deadline(snapshot,deadline_now));
+        if(owned)deadline=std::min(deadline,watchdog_deadline);
+        if(subscription.alive(deadline_now))
+            deadline=std::min(deadline,std::min(last_telemetry+10000000,subscription.last_ns+100000001));
+        if(!timer.arm(deadline)){perror("UDP scheduler timer");break;}
+        if(!running)break;
+        pollfd pollers[]={{sockfd,POLLIN,0},{wake->fd(),POLLIN,0},{timer.fd(),POLLIN,0}};
+        if(poll(pollers,3,udp_ready?0:-1)<0) {
+            if(errno==EINTR)continue;
+            perror("UDP scheduler poll");break;
+        }
+        if(!running)break;
+        const bool woke=(pollers[1].revents&POLLIN)!=0;
+        const bool timer_due=(pollers[2].revents&POLLIN)!=0;
+        if(woke) {
+            consume_scheduler_fd(wake->fd());
+            mover.writer_progress();click_retry=0;
+        }
+        if(timer_due)timer.consume();
+        const bool process_udp=udp_ready||(!(woke||timer_due)&&(pollers[0].revents&POLLIN));
+        udp_ready=(pollers[0].revents&POLLIN)!=0&&!process_udp;
+        if(!process_udp) {
+            if(woke||timer_due)continue;
+            break;
+        }
         uint8_t data[1024];sockaddr_in from{};socklen_t length=sizeof(from);
-        int n=recvfrom(sockfd,data,sizeof(data),MSG_TRUNC,reinterpret_cast<sockaddr*>(&from),&length);
+        int n=recvfrom(sockfd,data,sizeof(data),MSG_TRUNC|MSG_DONTWAIT,reinterpret_cast<sockaddr*>(&from),&length);
         if(n<=0||n>int(sizeof(data)))continue;if(peer_filter&&from.sin_addr.s_addr!=allowed.s_addr)continue;
         auto reply=[&](const std::string& reply_text){send_packet(from,reply_text.data(),reply_text.size());};
 

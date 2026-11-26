@@ -5,6 +5,8 @@
 #endif
 #include "mouse_mixer.h"
 #include "move_executor.h"
+#include "scheduler_wait.h"
+#include <poll.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -319,9 +321,72 @@ void transaction_writer_accounting() {
     }
 }
 
+void scheduler_deadlines_and_notifications() {
+    Fixture f;
+    auto wake=std::make_shared<SchedulerEvent>();
+    auto subscription=subscribe_mouse_scheduler([wake] {
+        // The callback may take the registry lock.
+        (void)endpoint_snapshot();
+        wake->signal();
+    });
+    assert(wake->fd()>=0);
+    auto readable=[&] {
+        pollfd fd{wake->fd(),POLLIN,0};
+        return poll(&fd,1,0)==1&&(fd.revents&POLLIN);
+    };
+    auto drain=[&] {assert(readable());consume_scheduler_fd(wake->fd());assert(!readable());};
+
+    using namespace move_protocol;
+    Request request;
+    request.session=100;request.command=1;request.budget_us=50000;
+    request.generation=endpoint_snapshot().generation;
+    request.dx=1;request.settle_us=300;request.return_us=200;
+    MoveExecutor mover;
+    mover.start(request,endpoint_snapshot(),fake_now);
+
+    MouseCommand movement;movement.x=1;
+    while(enqueue_report(movement,0,0,REPORT_MOVEMENT,false)==EnqueueResult::Ok){}
+    assert(mover.next_deadline(fake_now)==fake_now);
+    assert(!mover.tick(endpoint_snapshot(),fake_now));
+    assert(mover.next_deadline(fake_now)==fake_now+1000000);
+    assert(!readable());
+
+    f.complete(f.take());
+    drain(); // A capacity notification sent before poll is still readable.
+    mover.writer_progress();
+    assert(mover.next_deadline(fake_now)==fake_now);
+    assert(!mover.tick(endpoint_snapshot(),fake_now));
+    assert(mover.next_deadline(fake_now)==fake_now+50000000);
+    while(endpoint_snapshot().synthetic_pending)f.complete(f.take());
+    drain();
+    for(const auto& event:take_writer_events())mover.event(event);
+    assert(mover.next_deadline(fake_now)==fake_now+300000);
+    fake_now+=300000;
+    assert(!mover.tick(endpoint_snapshot(),fake_now));
+    assert(mover.next_deadline(fake_now)==fake_now+200000);
+
+    f.push_physical(0,1,0,0xa0);
+    drain();
+    assert(mover.tick(endpoint_snapshot(),fake_now)&&mover.ack().status==Status::Interrupted);
+    assert(mover.next_deadline(fake_now)==UINT64_MAX);
+    set_mouse_protocol(7,true);
+    drain();
+
+    SchedulerTimer timer;
+    assert(timer.fd()>=0&&timer.arm(1)); // A monotonic deadline already in the past.
+    pollfd timer_ready{timer.fd(),POLLIN,0};
+    assert(poll(&timer_ready,1,1000)==1&&(timer_ready.revents&POLLIN));
+    timer.consume();
+    assert(timer.arm(UINT64_MAX)&&poll(&timer_ready,1,0)==0);
+    subscription.reset();
+    set_mouse_protocol(7,false);
+    assert(!readable());
+}
+
 int main() {
     set_mouse_mixer_clock_for_test(fake_clock);
     transaction_writer_accounting();
+    scheduler_deadlines_and_notifications();
     physical_order_and_fusion();independent_button_masks_and_edges();
     overflow_supersession_failure_and_capacity();supersession_barriers();
     bounded_queue_and_cleanup();physical_completion_survives_synthetic_reset();

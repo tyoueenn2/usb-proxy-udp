@@ -85,6 +85,24 @@ std::mutex event_mutex;
 std::deque<WriterEvent> writer_events;
 bool writer_overflow=false;
 
+std::mutex scheduler_mutex;
+std::weak_ptr<const std::function<void()>> scheduler_wake;
+
+// Declare before taking a mixer lock so every notification runs after unlocking.
+struct WakeScheduler {
+    bool changed = true;
+
+    ~WakeScheduler() {
+        if(!changed)return;
+        std::shared_ptr<const std::function<void()>> wake;
+        {
+            std::lock_guard<std::mutex> lock(scheduler_mutex);
+            wake=scheduler_wake.lock();
+        }
+        if(wake)(*wake)();
+    }
+};
+
 void update_pending(Endpoint& endpoint) {
     if(endpoint.info&&endpoint.info->mouse_synthetic_pending)
         endpoint.info->mouse_synthetic_pending->store(!endpoint.synthetic.empty(),std::memory_order_release);
@@ -166,12 +184,22 @@ void invalidate_interface(int number) {
 }
 }
 
+std::shared_ptr<const std::function<void()>> subscribe_mouse_scheduler(std::function<void()> wake) {
+    auto subscription=std::make_shared<const std::function<void()>>(std::move(wake));
+    std::lock_guard<std::mutex> lock(scheduler_mutex);
+    scheduler_wake=subscription;
+    return subscription;
+}
+
 void learn_mouse_descriptor(int number,const uint8_t* data,unsigned length) {
-    auto profiles=parse_mouse_descriptor(data,length);std::lock_guard<std::mutex> lock(registry_mutex);
+    auto profiles=parse_mouse_descriptor(data,length);
+    WakeScheduler wake{false};
+    std::lock_guard<std::mutex> lock(registry_mutex);
     report_descriptors[number]=profiles;
-    if(!boot_protocol[number]){descriptors[number]=std::move(profiles);invalidate_interface(number);}
+    if(!boot_protocol[number]){descriptors[number]=std::move(profiles);invalidate_interface(number);wake.changed=true;}
 }
 void set_mouse_protocol(int number,bool boot) {
+    WakeScheduler wake;
     std::lock_guard<std::mutex> lock(registry_mutex);boot_protocol[number]=boot;
     if(boot) {
         MouseProfile profile;profile.size=3;profile.x={8,8,-127,127};profile.y={16,8,-127,127};
@@ -182,6 +210,7 @@ void set_mouse_protocol(int number,bool boot) {
     invalidate_interface(number);
 }
 void register_mouse_endpoint(thread_info* info,int number) {
+    WakeScheduler wake;
     std::lock_guard<std::mutex> lock(registry_mutex);Endpoint endpoint;
     endpoint.info=info;endpoint.interface_number=number;endpoint.generation=++next_generation;
     endpoint.instance=++next_endpoint_instance;
@@ -191,6 +220,7 @@ void register_mouse_endpoint(thread_info* info,int number) {
     endpoints[info->endpoint.bEndpointAddress]=std::move(endpoint);
 }
 void unregister_mouse_endpoint(thread_info* info) {
+    WakeScheduler wake;
     std::lock_guard<std::mutex> lock(registry_mutex);int address=info->endpoint.bEndpointAddress;
     auto found=endpoints.find(address);
     if(found!=endpoints.end()) {
@@ -203,6 +233,7 @@ void unregister_mouse_endpoint(thread_info* info) {
 }
 
 void queue_physical_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
+    WakeScheduler wake{false};
     std::lock_guard<std::mutex> lock(registry_mutex);auto found=endpoints.find(address);
     if(found==endpoints.end())return;
     auto& endpoint=found->second;auto* bytes=reinterpret_cast<uint8_t*>(io.data);
@@ -211,25 +242,28 @@ void queue_physical_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
     auto* profile=matching_profile(endpoint,bytes,io.inner.length);
     if(!profile)return;
     if(endpoint.latest.empty()) {
-        endpoint.profile=*profile;capture_report(address,endpoint.interface_number,bytes,io.inner.length);
+        wake.changed=true;endpoint.profile=*profile;capture_report(address,endpoint.interface_number,bytes,io.inner.length);
     }
     endpoint.latest.assign(bytes,bytes+io.inner.length);io.mouse_physical_match=1;
     io.physical_buttons=profile->button_mask(bytes);io.physical_x=profile->x.get(bytes);io.physical_y=profile->y.get(bytes);
     io.physical_wheel=profile->wheel.get(bytes);io.physical_pan=profile->pan.get(bytes);
-    if(io.physical_x||io.physical_y||io.physical_wheel||io.physical_pan||endpoint.physical_buttons!=io.physical_buttons)++endpoint.activity;
+    if(io.physical_x||io.physical_y||io.physical_wheel||io.physical_pan||endpoint.physical_buttons!=io.physical_buttons) {
+        ++endpoint.activity;wake.changed=true;
+    }
     endpoint.physical_buttons=io.physical_buttons;endpoint.physical_dx=io.physical_x;endpoint.physical_dy=io.physical_y;
     endpoint.cumulative_x=saturating_add(endpoint.cumulative_x,io.physical_x);
     endpoint.cumulative_y=saturating_add(endpoint.cumulative_y,io.physical_y);
     if(io.physical_x||io.physical_y)endpoint.last_motion_ns=io.physical_queued_ns;
-    ++endpoint.physical_received;if(selected<0)selected=address;
+    ++endpoint.physical_received;if(selected<0){selected=address;wake.changed=true;}
 }
 
 void seed_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
+    WakeScheduler wake{false};
     std::lock_guard<std::mutex> lock(registry_mutex);auto found=endpoints.find(address);
     if(found==endpoints.end())return;
     auto& endpoint=found->second;auto* bytes=reinterpret_cast<uint8_t*>(io.data);
     auto* profile=matching_profile(endpoint,bytes,io.inner.length);if(!profile)return;
-    endpoint.profile=*profile;endpoint.latest.assign(bytes,bytes+io.inner.length);
+    wake.changed=true;endpoint.profile=*profile;endpoint.latest.assign(bytes,bytes+io.inner.length);
     for(const auto& field:endpoint.profile.relative)field.put(endpoint.latest.data(),0);
     endpoint.profile.put_buttons(endpoint.latest.data(),0);endpoint.submitted_template=endpoint.latest;
     std::memcpy(io.data,endpoint.latest.data(),endpoint.latest.size());endpoint.physical_buttons=0;
@@ -386,6 +420,7 @@ bool take_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
 
 void notify_mouse_report_written(uint8_t address,const usb_raw_transfer_io& io,bool success) {
     if(!io.mouse_managed)return;
+    WakeScheduler wake{false};
     uint64_t written=monotonic_ns();bool emit=false,finished=false;WriterEvent event;
     {
         std::lock_guard<std::mutex> lock(registry_mutex);auto found=endpoints.find(address);
@@ -423,7 +458,9 @@ void notify_mouse_report_written(uint8_t address,const usb_raw_transfer_io& io,b
                 item.remaining.wheel-=io.synthetic_wheel;item.remaining.pan-=io.synthetic_pan;
                 finished=no_motion(item.remaining)&&item.buttons_committed;
             }
+            const auto previous_depth=endpoint.synthetic.size();
             endpoint.inflight=false;endpoint.inflight_id=0;if(success)remove_finished_front(endpoint);else update_pending(endpoint);
+            wake.changed=endpoint.synthetic.size()<previous_depth;
         }
         if(current_layout&&(io.mouse_report_kind==REPORT_CLICK_PRESS||io.mouse_report_kind==REPORT_CLICK_RELEASE||
            io.mouse_report_kind==REPORT_RELEASE_ALL||io.mouse_report_kind>=REPORT_TRANSACTION_OUT||!success)) {
@@ -433,6 +470,7 @@ void notify_mouse_report_written(uint8_t address,const usb_raw_transfer_io& io,b
         }
     }
     if(emit) {
+        wake.changed=true;
         std::lock_guard<std::mutex> lock(event_mutex);
         if(writer_events.size()>=MAX_WRITER_EVENTS)writer_overflow=true;else writer_events.push_back(event);
     }
