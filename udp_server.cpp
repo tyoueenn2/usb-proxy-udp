@@ -97,7 +97,7 @@ void UdpServer::server_loop(SchedulerTimer& timer) {
     upx_replay::Tracker movement_replay;
     bool release_pending=false,release_inflight=false;Key release_key{};
     proxy_telemetry::Subscription subscription;proxy_telemetry::Snapshot previous_telemetry;
-    sockaddr_in subscriber{};uint64_t last_telemetry=0;
+    sockaddr_in subscriber{};uint64_t last_telemetry=0,last_steering_token=0;
     in_addr allowed{};const char* peer_filter=std::getenv("USB_PROXY_PEER");
     if(peer_filter&&inet_pton(AF_INET,peer_filter,&allowed)!=1)return;
 
@@ -321,9 +321,48 @@ void UdpServer::server_loop(SchedulerTimer& timer) {
         if(n<=0||n>int(sizeof(data)))continue;if(peer_filter&&from.sin_addr.s_addr!=allowed.s_addr)continue;
         auto reply=[&](const std::string& reply_text){send_packet(from,reply_text.data(),reply_text.size());};
 
+        uint64_t history_session=0,history_token=0;
+        if(mouse_history::parse_query(data,size_t(n),history_session,history_token)) {
+            // Only the active telemetry peer can request recent physical movement.
+            if(subscription.version==3&&subscription.alive(now_ns())&&
+               subscription.client==history_session&&same_peer(subscriber,from)) {
+                mouse_history::Reply history;
+                history.session=history_session;history.token=history_token;history.epoch=server_epoch;
+                if(physical_mouse_history(history)) {
+                    const auto packet=mouse_history::packet(history);
+                    send_packet(from,packet.data(),packet.size());
+                }
+            }
+            continue;
+        }
+        if(n>=4&&!std::memcmp(data,"UPJ1",4)) {
+            mouse_history::Steering plan;
+            const auto now=now_ns();
+            if(mouse_history::parse_steering(data,size_t(n),plan)&&plan.epoch==server_epoch&&
+               same_peer(subscriber,from)&&subscription.alive(now)&&subscription.version==3&&
+               plan.session==subscription.client&&plan.token>last_steering_token) {
+                last_steering_token=plan.token;
+                if(!plan.angle_cdeg) {
+                    set_mouse_steering(plan);
+                } else if((!owned||same_peer(owner,from))&&!mover.active()&&work.empty()&&!release_pending&&
+                          set_mouse_steering(plan)) {
+                    owner=from;owned=true;last=Clock::now();tracked_generation=plan.generation;
+                }
+            }
+            continue;
+        }
         if(n>=4&&(!std::memcmp(data,"UPS1",4)||!std::memcmp(data,"UPS2",4)||!std::memcmp(data,"UPS3",4))) {
             if(subscription.alive(now_ns())&&!same_peer(subscriber,from)){reply("busy");continue;}
-            if(subscription.accept(data,size_t(n),now_ns())){subscriber=from;last_telemetry=0;}
+            const auto previous_client=subscription.client;
+            const auto previous_version=subscription.version;
+            if(subscription.accept(data,size_t(n),now_ns())) {
+                if(subscription.client!=previous_client||subscription.version!=previous_version||
+                   !same_peer(subscriber,from)) {
+                    last_steering_token=0;
+                    clear_mouse_steering();
+                }
+                subscriber=from;last_telemetry=0;
+            }
             continue;
         }
         if(n>=4&&!std::memcmp(data,"UPQ1",4)) {
