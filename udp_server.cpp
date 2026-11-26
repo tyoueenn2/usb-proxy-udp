@@ -321,6 +321,20 @@ void UdpServer::server_loop(SchedulerTimer& timer) {
         if(n<=0||n>int(sizeof(data)))continue;if(peer_filter&&from.sin_addr.s_addr!=allowed.s_addr)continue;
         auto reply=[&](const std::string& reply_text){send_packet(from,reply_text.data(),reply_text.size());};
 
+        uint64_t history_session=0,history_token=0;
+        if(mouse_history::parse_query(data,size_t(n),history_session,history_token)) {
+            // Only the active telemetry peer can request recent physical movement.
+            if(subscription.version==3&&subscription.alive(now_ns())&&
+               subscription.client==history_session&&same_peer(subscriber,from)) {
+                mouse_history::Reply history;
+                history.session=history_session;history.token=history_token;history.epoch=server_epoch;
+                if(physical_mouse_history(history)) {
+                    const auto packet=mouse_history::packet(history);
+                    send_packet(from,packet.data(),packet.size());
+                }
+            }
+            continue;
+        }
         if(n>=4&&(!std::memcmp(data,"UPS1",4)||!std::memcmp(data,"UPS2",4)||!std::memcmp(data,"UPS3",4))) {
             if(subscription.alive(now_ns())&&!same_peer(subscriber,from)){reply("busy");continue;}
             if(subscription.accept(data,size_t(n),now_ns())){subscriber=from;last_telemetry=0;}
@@ -458,7 +472,8 @@ void UdpServer::server_loop(SchedulerTimer& timer) {
         if(n==16&&!std::memcmp(data,"UPX1",4)) {
             uint32_t sequence=read_be32(data+4);uint64_t packet_now=now_ns();
             upx_replay::Peer movement_peer{from.sin_addr.s_addr,from.sin_port};
-            if(data[15]||movement_replay.stale(movement_peer,sequence,packet_now))continue;
+            const bool hand_assist=data[15]==mouse_history::guarded_assist;
+            if((data[15]&&!hand_assist)||movement_replay.stale(movement_peer,sequence,packet_now))continue;
             MouseCommand command;command.x=read_i16(data+8);command.y=read_i16(data+10);
             command.wheel=data[12]<128?data[12]:int(data[12])-256;
             command.pan=data[13]<128?data[13]:int(data[13])-256;uint8_t next=data[14];
@@ -468,10 +483,15 @@ void UdpServer::server_loop(SchedulerTimer& timer) {
                 continue;
             }
             bool transition=next!=persistent_buttons;bool movement=command.x||command.y;
+            if(hand_assist&&(e.poll_us>1000||transition||!movement||command.wheel||command.pan||
+                            !same_peer(subscriber,from)||!subscription.alive(packet_now)||
+                            subscription.version!=3))continue;
             EnqueueResult result=EnqueueResult::Ok;
-            if(transition||movement||command.wheel||command.pan)
-                result=enqueue_report(command,next,scheduled_buttons,transition?REPORT_PERSISTENT:REPORT_MOVEMENT,
+            if(transition||movement||command.wheel||command.pan) {
+                const auto kind=hand_assist?REPORT_HAND_ASSIST:transition?REPORT_PERSISTENT:REPORT_MOVEMENT;
+                result=enqueue_report(command,next,scheduled_buttons,kind,
                     !transition&&movement&&!command.wheel&&!command.pan);
+            }
             if(result==EnqueueResult::Ok) {
                 persistent_buttons=next;movement_replay.accept(movement_peer,sequence,packet_now);
                 owner=from;owned=true;last=Clock::now();tracked_generation=e.generation;

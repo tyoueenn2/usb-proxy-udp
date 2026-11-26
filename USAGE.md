@@ -57,7 +57,7 @@ with MouseProxy('192.168.1.20') as mouse:
 | 12 | 1 | Signed wheel |
 | 13 | 1 | Signed horizontal pan |
 | 14 | 1 | Complete persistent injected button mask |
-| 15 | 1 | Reserved; must be zero |
+| 15 | 1 | Zero for ordinary movement, 1 for hand-guarded movement |
 
 Python encoding:
 
@@ -422,3 +422,27 @@ writer failure, layout change and shutdown stop further transaction movement and
 leave the existing final-release obligation active. They may report a residual or
 uncertain return. Never treat writer completion as observed desktop position or
 replay displacement after an endpoint change.
+
+### Live physical movement history
+
+An active UPT3 subscriber can request the most recent 164 complete 1 ms
+intervals of physical XY input for live movement assistance. The proxy keeps
+the window in memory and clears it when the endpoint layout changes. The
+endpoint must support a polling interval of 1 ms or faster. Genuine physical
+reports are summed within each interval, and quiet intervals carry zero.
+
+The 24-byte request preserves the usual subscription session and token fields.
+Bytes 0–7 are `UPS3HIS1`. Older proxy versions ignore the nonzero reserved
+field. The reply starts with `UPH1` and four reserved zero bytes, followed by the
+session, token, server epoch, endpoint generation, and monotonic end time in
+milliseconds as five unsigned big-endian 64-bit values. The payload contains
+164 oldest-first pairs of signed big-endian 16-bit XY counts. The interval
+containing the end time is still open and excluded. A history query has no
+effect on the controller lease or telemetry renewal.
+
+The live history client can set byte 15 of an UPX1 movement packet to 1.
+The proxy accepts this form from the active UPT3 subscriber when its button
+snapshot matches the existing synthetic button state and wheel and pan are
+zero. The mixer checks that it follows fresh physical movement, both on
+enqueue and before preparing the HID write. Queued assistance expires after
+6 ms. Legacy proxy versions ignore this optional form.

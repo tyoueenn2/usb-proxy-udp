@@ -1,5 +1,6 @@
 #pragma once
 #include "mouse_protocol.h"
+#include "mouse_history_protocol.h"
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -16,6 +17,7 @@ enum ReportKind:uint8_t {
     REPORT_CLICK_PRESS,
     REPORT_CLICK_RELEASE,
     REPORT_RELEASE_ALL,
+    REPORT_HAND_ASSIST,
     REPORT_TRANSACTION_OUT,
     REPORT_TRANSACTION_PRESS,
     REPORT_TRANSACTION_RELEASE,
@@ -57,6 +59,7 @@ void notify_mouse_report_written(uint8_t endpoint,const usb_raw_transfer_io& io,
 std::shared_ptr<const std::function<void()>> subscribe_mouse_scheduler(std::function<void()> wake);
 
 EndpointSnapshot endpoint_snapshot();
+bool physical_mouse_history(mouse_history::Reply& reply);
 uint64_t mouse_residence_p99_ns();
 std::string mouse_state_text();
 EnqueueResult enqueue_report(MouseCommand command,uint8_t persistent,uint8_t scheduled,

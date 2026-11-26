@@ -406,6 +406,55 @@ void scheduler_deadlines_and_notifications() {
     assert(!readable());
 }
 
+void physical_report_history() {
+    Fixture f;
+    mouse_history::Reply history;
+    assert(!physical_mouse_history(history));
+    fake_now += (mouse_history::samples - 1) * mouse_history::tick_ns;
+    f.push_physical(0, 3, -1, 0xa0);
+    f.complete(f.take());
+    f.push_physical(0, 2, -2, 0xa0);
+    f.complete(f.take());
+    fake_now += 2 * mouse_history::tick_ns;
+    f.push_physical(0, 9, 5, 0xa0);
+    f.complete(f.take());
+    assert(physical_mouse_history(history));
+    assert(history.end_ms == fake_now / mouse_history::tick_ns);
+    assert((history.trace[history.trace.size() - 2] == std::array<int, 2>{5, -3}));
+    assert((history.trace.back() == std::array<int, 2>{0, 0}));
+    fake_now += mouse_history::tick_ns;
+    assert(physical_mouse_history(history));
+    assert((history.trace.back() == std::array<int, 2>{9, 5}));
+    f.info.mouse_poll_interval_us = 2000;
+    assert(!physical_mouse_history(history));
+    set_mouse_protocol(7, true);
+    assert(!physical_mouse_history(history));
+    set_mouse_protocol(7, false);
+}
+
+void guarded_assistance_follows_the_live_hand() {
+    Fixture f;
+    MouseCommand assist;assist.x=3;
+    assert(enqueue_report(assist,0,0,REPORT_HAND_ASSIST,true)==EnqueueResult::NotReady);
+    f.push_physical(0,5,0,0xa0);f.complete(f.take());
+    f.enqueue(assist,0,0,REPORT_HAND_ASSIST,true);
+    auto first=f.take();
+    assert(first.synthetic_x==3&&first.mouse_report_kind==REPORT_HAND_ASSIST);
+    f.complete(first);
+    f.enqueue(assist,0,0,REPORT_HAND_ASSIST,true);
+    fake_now+=1000000;
+    f.push_physical(0,-5,0,0xa0);
+    auto reversed=f.take();
+    assert(reversed.mouse_physical&&reversed.synthetic_x==0&&Fixture::x(reversed)==-5);
+    f.complete(reversed);
+    assist.x=-3;
+    f.enqueue(assist,0,0,REPORT_HAND_ASSIST,true);
+    fake_now+=7000000;
+    usb_raw_transfer_io quiet{};
+    assert(!take_mouse_report(Fixture::address,quiet));
+    assert(endpoint_snapshot().synthetic_pending==0);
+}
+
 int main() {
     set_mouse_mixer_clock_for_test(fake_clock);
     transaction_writer_accounting();
@@ -416,6 +465,8 @@ int main() {
     physical_completion_survives_layout_change();stale_endpoint_completion_is_ignored();
     bounded_completion_events();
     cached_layout_and_residence();
+    physical_report_history();
+    guarded_assistance_follows_the_live_hand();
     cadence_fairness_and_residence(8000);cadence_fairness_and_residence(1000);cadence_fairness_and_residence(125);
     set_mouse_mixer_clock_for_test(nullptr);
     std::cout<<"Mixer ordering, fusion, masks, overflow, retries, bounds, fairness and fake cadences passed\n";

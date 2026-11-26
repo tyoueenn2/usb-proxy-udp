@@ -54,6 +54,48 @@ struct SyntheticItem {
     bool latest=false,buttons_committed=false;
 };
 
+struct PhysicalHistory {
+    struct Bin {
+        uint64_t tick = 0;
+        int64_t x = 0, y = 0;
+    };
+    std::array<Bin, mouse_history::samples + 1> bins{};
+    uint64_t first = UINT64_MAX;
+
+    void record(uint64_t stamp, int x, int y) {
+        const auto tick = stamp / mouse_history::tick_ns;
+        // Start at the first complete millisecond after the endpoint is ready.
+        if (first == UINT64_MAX)
+            first = tick + 1;
+        if (!x && !y)
+            return;
+        auto& bin = bins[tick % bins.size()];
+        if (bin.tick != tick)
+            bin = {tick, 0, 0};
+        bin.x += x;
+        bin.y += y;
+    }
+
+    bool copy(uint64_t stamp, mouse_history::Reply& reply) const {
+        const auto end = stamp / mouse_history::tick_ns;
+        if (end < mouse_history::samples || end - mouse_history::samples < first)
+            return false;
+        reply.end_ms = end;
+        for (size_t i = 0; i < mouse_history::samples; ++i) {
+            const auto tick = end - mouse_history::samples + i;
+            const auto& bin = bins[tick % bins.size()];
+            if (bin.tick != tick) {
+                reply.trace[i] = {};
+                continue;
+            }
+            if (bin.x < INT16_MIN || bin.x > INT16_MAX || bin.y < INT16_MIN || bin.y > INT16_MAX)
+                return false;
+            reply.trace[i] = {int(bin.x), int(bin.y)};
+        }
+        return true;
+    }
+};
+
 struct Endpoint {
     thread_info* info=nullptr;
     int interface_number=0;
@@ -63,9 +105,11 @@ struct Endpoint {
     std::vector<uint8_t> latest,submitted_template;
     std::deque<SyntheticItem> synthetic;
     std::deque<uint64_t> residence_ns;
+    PhysicalHistory physical_history;
     uint8_t physical_buttons=0,submitted_physical_buttons=0;
     uint8_t persistent_buttons=0,scheduled_buttons=0;
     int physical_dx=0,physical_dy=0;
+    int hand_dx=0,hand_dy=0;
     int64_t cumulative_x=0,cumulative_y=0;
     uint64_t generation=0,instance=0,next_item=1,physical_barrier=0,last_motion_ns=0;
     uint64_t physical_received=0,physical_submitted=0,superseded=0,writer_failures=0,activity=0;
@@ -178,9 +222,21 @@ void remove_finished_front(Endpoint& endpoint) {
     }
     update_pending(endpoint);
 }
+constexpr uint64_t hand_motion_fresh_ns = 6 * mouse_history::tick_ns;
+
+bool follows_hand(const Endpoint& endpoint,const MouseCommand& command,uint64_t now) {
+    return endpoint.last_motion_ns&&now>=endpoint.last_motion_ns&&
+        now-endpoint.last_motion_ns<=hand_motion_fresh_ns&&
+        (int64_t(command.x)*endpoint.hand_dx+int64_t(command.y)*endpoint.hand_dy)>0;
+}
+
 void expire_front(Endpoint& endpoint,uint64_t now) {
     while(!endpoint.synthetic.empty()) {
         auto& item=endpoint.synthetic.front();
+        if(item.kind==REPORT_HAND_ASSIST&&!follows_hand(endpoint,item.remaining,now)) {
+            endpoint.synthetic.pop_front();
+            continue;
+        }
         if(item.deadline_ns&&now>item.deadline_ns) {
             item.remaining.x=item.remaining.y=item.remaining.wheel=item.remaining.pan=0;
         }
@@ -198,7 +254,8 @@ void invalidate_interface(int number) {
     for(auto& pair:endpoints)if(pair.second.interface_number==number) {
         auto& endpoint=pair.second;
         endpoint.latest.clear();endpoint.submitted_template.clear();endpoint.synthetic.clear();
-        endpoint.layout=0;endpoint.supported=0;
+        endpoint.layout=0;endpoint.supported=0;endpoint.physical_history={};
+        endpoint.hand_dx=endpoint.hand_dy=0;
         endpoint.persistent_buttons=endpoint.scheduled_buttons=0;
         endpoint.inflight=false;endpoint.inflight_id=0;endpoint.generation=++next_generation;
         update_pending(endpoint);if(endpoint.info)endpoint.info->data_cond->notify_all();
@@ -269,13 +326,17 @@ void queue_physical_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
     endpoint.latest.assign(bytes,bytes+io.inner.length);io.mouse_physical_match=1;
     io.physical_buttons=profile->button_mask(bytes);io.physical_x=profile->x.get(bytes);io.physical_y=profile->y.get(bytes);
     io.physical_wheel=profile->wheel.get(bytes);io.physical_pan=profile->pan.get(bytes);
+    endpoint.physical_history.record(io.physical_queued_ns,io.physical_x,io.physical_y);
     if(io.physical_x||io.physical_y||io.physical_wheel||io.physical_pan||endpoint.physical_buttons!=io.physical_buttons) {
         ++endpoint.activity;wake.changed=true;
     }
     endpoint.physical_buttons=io.physical_buttons;endpoint.physical_dx=io.physical_x;endpoint.physical_dy=io.physical_y;
     endpoint.cumulative_x=saturating_add(endpoint.cumulative_x,io.physical_x);
     endpoint.cumulative_y=saturating_add(endpoint.cumulative_y,io.physical_y);
-    if(io.physical_x||io.physical_y)endpoint.last_motion_ns=io.physical_queued_ns;
+    if(io.physical_x||io.physical_y) {
+        endpoint.last_motion_ns=io.physical_queued_ns;
+        endpoint.hand_dx=io.physical_x;endpoint.hand_dy=io.physical_y;
+    }
     ++endpoint.physical_received;if(selected<0){selected=address;wake.changed=true;}
 }
 
@@ -318,6 +379,15 @@ EndpointSnapshot endpoint_snapshot() {
     return snapshot;
 }
 
+bool physical_mouse_history(mouse_history::Reply& reply) {
+    std::lock_guard<std::mutex> lock(registry_mutex);
+    const auto found=endpoints.find(selected);
+    if(found==endpoints.end()||found->second.latest.empty()||
+       found->second.info->mouse_poll_interval_us>1000)return false;
+    reply.generation=found->second.generation;
+    return found->second.physical_history.copy(monotonic_ns(),reply);
+}
+
 uint64_t mouse_residence_p99_ns() {
     std::array<uint64_t,MAX_RESIDENCE_SAMPLES> samples;
     size_t count;
@@ -351,17 +421,22 @@ EnqueueResult enqueue_report(MouseCommand command,uint8_t persistent,uint8_t sch
     auto& endpoint=found->second;
     if((expected_generation&&endpoint.generation!=expected_generation)||
        (expected_activity!=UINT64_MAX&&endpoint.activity!=expected_activity))return EnqueueResult::NotReady;
+    const auto now=kind==REPORT_HAND_ASSIST?monotonic_ns():0;
+    if(kind==REPORT_HAND_ASSIST&&!follows_hand(endpoint,command,now))return EnqueueResult::NotReady;
     command.buttons=persistent|scheduled;
     if(split_mouse_command(endpoint.profile,command).empty())return EnqueueResult::Unsupported;
+    const auto replaceable=kind==REPORT_HAND_ASSIST?REPORT_HAND_ASSIST:REPORT_MOVEMENT;
     if(latest)while(!endpoint.synthetic.empty()) {
         const auto& tail=endpoint.synthetic.back();
-        if((endpoint.inflight&&tail.id==endpoint.inflight_id)||!tail.latest||tail.kind!=REPORT_MOVEMENT||
+        if((endpoint.inflight&&tail.id==endpoint.inflight_id)||!tail.latest||tail.kind!=replaceable||
            tail.persistent!=persistent||tail.physical_barrier!=endpoint.physical_barrier)break;
         endpoint.synthetic.pop_back();++endpoint.superseded;
     }
     if(endpoint.synthetic.size()>=MAX_SYNTHETIC_ITEMS)return EnqueueResult::QueueFull;
     SyntheticItem item;item.id=endpoint.next_item++;item.generation=endpoint.generation;
-    item.deadline_ns=latest?monotonic_ns()+25000000:0;item.physical_barrier=endpoint.physical_barrier;
+    item.deadline_ns=kind==REPORT_HAND_ASSIST?now+hand_motion_fresh_ns:
+        latest?monotonic_ns()+25000000:0;
+    item.physical_barrier=endpoint.physical_barrier;
     item.session=session;item.command_id=command_id;item.click_index=click_index;item.remaining=command;
     item.persistent=persistent;item.scheduled=scheduled;item.click_button=click_button;
     item.guard_activity=expected_activity;item.kind=kind;item.latest=latest;endpoint.synthetic.push_back(item);update_pending(endpoint);
