@@ -422,3 +422,44 @@ writer failure, layout change and shutdown stop further transaction movement and
 leave the existing final-release obligation active. They may report a residual or
 uncertain return. Never treat writer completion as observed desktop position or
 replay displacement after an endpoint change.
+
+### Live physical movement history
+
+An active UPT3 subscriber can request the most recent 164 complete 1 ms
+intervals of physical XY input for live movement assistance. The proxy keeps
+the window in memory and clears it when the endpoint layout changes. The
+endpoint must support a polling interval of 1 ms or faster. Genuine physical
+reports are summed within each interval, and quiet intervals carry zero.
+
+The 24-byte request preserves the usual subscription session and token fields.
+Bytes 0–7 are `UPS3HIS1`. Older proxy versions ignore the nonzero reserved
+field. The reply starts with `UPH1` and four reserved zero bytes, followed by the
+session, token, server epoch, endpoint generation, and monotonic end time in
+milliseconds as five unsigned big-endian 64-bit values. The payload contains
+164 oldest-first pairs of signed big-endian 16-bit XY counts. The interval
+containing the end time is still open and excluded. A history query has no
+effect on the controller lease or telemetry renewal.
+
+### Live movement steering
+
+`UPJ1` sets a short-lived direction for physical XY reports. Only the active
+UPT3 subscriber may send it. The proxy verifies the server epoch and endpoint
+generation, and rejects replayed sequence tokens. A steering update renews
+the controller lease only when the proxy can use it.
+
+The 64-byte network-order packet starts with `UPJ1`, a 16-bit angle in
+hundredths of a degree, an 8-bit mode, and one reserved zero byte. It then carries six
+unsigned 64-bit values in order: session, sequence token, epoch, generation,
+history end time in monotonic milliseconds, and expiry time in the same clock.
+Four signed 16-bit values encode aim X/Y and desired tangent X/Y as direction
+components scaled by 10,000. The permitted angle is 0.50–90.00 degrees. To
+cancel, set the mode, angle, both timestamps, and all direction components to zero.
+
+The expiry may be at most 20 ms after the history end time. Receiver selects
+the mode from its current detection. Mode 0 checks the original physical
+direction before steering each report. The mixer cancels when the hand leaves
+the configured angle and passes the out-of-cone report through. Mode 1 redirects
+the magnitude of every physical movement along the targetward tangent even if
+the physical direction is reversed. Mode 2 holds XY at zero while centered and
+requires zero direction components. All modes preserve report count, output
+pacing, wheel, and physical buttons. Synthetic output takes priority.

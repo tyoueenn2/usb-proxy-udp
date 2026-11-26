@@ -379,8 +379,41 @@ void move_transaction_udp() {
     assert(!(interrupted.flags&2)&&interrupted.residual_x==5);
 }
 
+void subscribed_physical_history() {
+    Fixture f;
+    std::this_thread::sleep_for(std::chrono::milliseconds(170));
+    auto request = mouse_history::query(21, 2);
+    std::array<uint8_t, 1024> packet{};
+    f.send_bytes(request.data(), request.size());
+    assert(recv(f.fd, packet.data(), packet.size(), 0) < 0);
+
+    auto subscribe = mouse_history::query(21, 1);
+    std::fill(subscribe.begin() + 4, subscribe.begin() + 8, 0);
+    f.send_bytes(subscribe.data(), subscribe.size());
+    f.physical(0, 4, -3);
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    f.send_bytes(request.data(), request.size());
+    mouse_history::Reply history;
+    assert(f.wait_until([&] {
+        const auto n = recv(f.fd, packet.data(), packet.size(), 0);
+        return n > 0 && mouse_history::parse_reply(packet.data(), size_t(n), history);
+    }));
+    assert(history.token == 2 && history.session == 21 &&
+           history.generation == endpoint_snapshot().generation);
+    assert((std::find(history.trace.begin(), history.trace.end(), std::array<int, 2>{4, -3}) !=
+            history.trace.end()));
+
+    const int other = test_client_socket();
+    timeval timeout{0, 20000};
+    setsockopt(other, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    assert(send(other, request.data(), request.size(), 0) == ssize_t(request.size()));
+    assert(recv(other, packet.data(), packet.size(), 0) < 0);
+    close(other);
+}
+
 int main() {
     move_transaction_udp();
+    subscribed_physical_history();
     no_endpoint_statuses();
     delayed_upx_replay_tests();
     Fixture f;

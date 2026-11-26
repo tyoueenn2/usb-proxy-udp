@@ -7,11 +7,13 @@
 #include "usb_capture.h"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 
 namespace {
 using Clock=std::chrono::steady_clock;
@@ -54,16 +56,70 @@ struct SyntheticItem {
     bool latest=false,buttons_committed=false;
 };
 
+struct PhysicalHistory {
+    struct Bin {
+        uint64_t tick = 0;
+        int64_t x = 0, y = 0;
+    };
+    std::array<Bin, mouse_history::samples + 1> bins{};
+    uint64_t first = UINT64_MAX;
+
+    void record(uint64_t stamp, int x, int y) {
+        const auto tick = stamp / mouse_history::tick_ns;
+        // Start at the first complete millisecond after the endpoint is ready.
+        if (first == UINT64_MAX)
+            first = tick + 1;
+        if (!x && !y)
+            return;
+        auto& bin = bins[tick % bins.size()];
+        if (bin.tick != tick)
+            bin = {tick, 0, 0};
+        bin.x += x;
+        bin.y += y;
+    }
+
+    bool copy(uint64_t stamp, mouse_history::Reply& reply) const {
+        const auto end = stamp / mouse_history::tick_ns;
+        if (end < mouse_history::samples || end - mouse_history::samples < first)
+            return false;
+        reply.end_ms = end;
+        for (size_t i = 0; i < mouse_history::samples; ++i) {
+            const auto tick = end - mouse_history::samples + i;
+            const auto& bin = bins[tick % bins.size()];
+            if (bin.tick != tick) {
+                reply.trace[i] = {};
+                continue;
+            }
+            if (bin.x < INT16_MIN || bin.x > INT16_MAX || bin.y < INT16_MIN || bin.y > INT16_MAX)
+                return false;
+            reply.trace[i] = {int(bin.x), int(bin.y)};
+        }
+        return true;
+    }
+};
+
+struct ActiveSteering {
+    uint64_t received_ns, expires_ms;
+    double aim_x, aim_y, radius, tangent=0;
+    mouse_history::SteeringMode mode;
+    double unit_x=0,unit_y=0;
+};
 struct Endpoint {
     thread_info* info=nullptr;
     int interface_number=0;
     MouseProfile profile;
+    uint64_t layout=0;
+    uint8_t supported=0;
     std::vector<uint8_t> latest,submitted_template;
     std::deque<SyntheticItem> synthetic;
     std::deque<uint64_t> residence_ns;
+    PhysicalHistory physical_history;
+    std::optional<ActiveSteering> steering;
+    uint64_t steering_abort_ms=0;
     uint8_t physical_buttons=0,submitted_physical_buttons=0;
     uint8_t persistent_buttons=0,scheduled_buttons=0;
     int physical_dx=0,physical_dy=0;
+    int hand_dx=0,hand_dy=0;
     int64_t cumulative_x=0,cumulative_y=0;
     uint64_t generation=0,instance=0,next_item=1,physical_barrier=0,last_motion_ns=0;
     uint64_t physical_received=0,physical_submitted=0,superseded=0,writer_failures=0,activity=0;
@@ -85,15 +141,52 @@ std::mutex event_mutex;
 std::deque<WriterEvent> writer_events;
 bool writer_overflow=false;
 
+std::mutex scheduler_mutex;
+std::weak_ptr<const std::function<void()>> scheduler_wake;
+
+// Declare before taking a mixer lock so every notification runs after unlocking.
+struct WakeScheduler {
+    bool changed = true;
+
+    ~WakeScheduler() {
+        if(!changed)return;
+        std::shared_ptr<const std::function<void()>> wake;
+        {
+            std::lock_guard<std::mutex> lock(scheduler_mutex);
+            wake=scheduler_wake.lock();
+        }
+        if(wake)(*wake)();
+    }
+};
+
 void update_pending(Endpoint& endpoint) {
     if(endpoint.info&&endpoint.info->mouse_synthetic_pending)
         endpoint.info->mouse_synthetic_pending->store(!endpoint.synthetic.empty(),std::memory_order_release);
 }
+void cache_layout(Endpoint& endpoint,const MouseProfile& profile) {
+    // Stable layout fingerprint, independent of process/generation numbers.
+    uint64_t layout=1469598103934665603ull;
+    auto hash=[&](uint64_t n){for(int i=0;i<8;++i){layout^=uint8_t(n);layout*=1099511628211ull;n>>=8;}};
+    hash(profile.id);hash(profile.size);
+    auto field=[&](const HidField& f){hash(f.offset);hash(f.bits);hash(uint32_t(f.minimum));hash(uint32_t(f.maximum));};
+    field(profile.x);field(profile.y);field(profile.wheel);field(profile.pan);
+    for(const auto& b:profile.buttons){hash(b.first);field(b.second);}
+    endpoint.layout=layout?layout:1;
+    endpoint.supported=0;
+    for(const auto& button:profile.buttons)
+        endpoint.supported|=uint8_t(1u<<(button.first-1));
+}
+
 MouseProfile* matching_profile(Endpoint& endpoint,const uint8_t* data,size_t size) {
-    for(auto& profile:descriptors[endpoint.interface_number])
-        if(profile.matches(data,size)&&(endpoint.latest.empty()||profile.id==endpoint.profile.id))return &profile;
+    for(auto& profile:descriptors[endpoint.interface_number]) {
+        if(profile.matches(data,size)&&(endpoint.latest.empty()||profile.id==endpoint.profile.id)) {
+            if(!endpoint.layout)cache_layout(endpoint,profile);
+            return &profile;
+        }
+    }
     return nullptr;
 }
+
 bool field_fits(const HidField& field,int physical,int synthetic) {
     if(!synthetic)return true;
     if(!field.bits)return false;
@@ -139,6 +232,55 @@ void remove_finished_front(Endpoint& endpoint) {
     }
     update_pending(endpoint);
 }
+double steering_bearing(const ActiveSteering& steering,int x,int y) {
+    return std::atan2(steering.aim_x*y-steering.aim_y*x,steering.aim_x*x+steering.aim_y*y);
+}
+
+void abort_steering(Endpoint& endpoint,uint64_t now) {
+    endpoint.steering.reset();
+    endpoint.steering_abort_ms=now/mouse_history::tick_ns;
+}
+
+void steer_physical(Endpoint& endpoint,const usb_raw_transfer_io& io,uint64_t now,int& x,int& y) {
+    if(!endpoint.steering||(!x&&!y))
+        return;
+    const auto& steering=*endpoint.steering;
+    if(now/mouse_history::tick_ns>=steering.expires_ms) {
+        endpoint.steering.reset();
+        return;
+    }
+    if(io.physical_queued_ns<steering.received_ns||
+       now-io.physical_queued_ns>=mouse_history::steering_lifetime_ms*mouse_history::tick_ns)
+        return;
+    using Mode=mouse_history::SteeringMode;
+    if(steering.mode==Mode::hold) {
+        x=y=0;
+        return;
+    }
+    // Rotate the same vector. Only HID integer quantization changes its length.
+    double dx,dy;
+    if(steering.mode==Mode::inner) {
+        const auto magnitude=std::hypot(x,y);
+        dx=std::round(steering.unit_x*magnitude);
+        dy=std::round(steering.unit_y*magnitude);
+    } else {
+        const auto bearing=steering_bearing(steering,x,y);
+        if(std::abs(bearing)>steering.radius) {
+            abort_steering(endpoint,now);
+            return;
+        }
+        const auto delta=std::clamp(steering.tangent-bearing,-steering.radius,steering.radius);
+        const auto c=std::cos(delta),s=std::sin(delta);
+        dx=std::round(x*c-y*s);
+        dy=std::round(x*s+y*c);
+    }
+    if(dx>=endpoint.profile.x.minimum&&dx<=endpoint.profile.x.maximum&&
+       dy>=endpoint.profile.y.minimum&&dy<=endpoint.profile.y.maximum) {
+        x=int(dx);
+        y=int(dy);
+    }
+}
+
 void expire_front(Endpoint& endpoint,uint64_t now) {
     while(!endpoint.synthetic.empty()) {
         auto& item=endpoint.synthetic.front();
@@ -159,6 +301,9 @@ void invalidate_interface(int number) {
     for(auto& pair:endpoints)if(pair.second.interface_number==number) {
         auto& endpoint=pair.second;
         endpoint.latest.clear();endpoint.submitted_template.clear();endpoint.synthetic.clear();
+        endpoint.layout=0;endpoint.supported=0;endpoint.physical_history={};
+        endpoint.hand_dx=endpoint.hand_dy=0;
+        abort_steering(endpoint,monotonic_ns());
         endpoint.persistent_buttons=endpoint.scheduled_buttons=0;
         endpoint.inflight=false;endpoint.inflight_id=0;endpoint.generation=++next_generation;
         update_pending(endpoint);if(endpoint.info)endpoint.info->data_cond->notify_all();
@@ -166,12 +311,22 @@ void invalidate_interface(int number) {
 }
 }
 
+std::shared_ptr<const std::function<void()>> subscribe_mouse_scheduler(std::function<void()> wake) {
+    auto subscription=std::make_shared<const std::function<void()>>(std::move(wake));
+    std::lock_guard<std::mutex> lock(scheduler_mutex);
+    scheduler_wake=subscription;
+    return subscription;
+}
+
 void learn_mouse_descriptor(int number,const uint8_t* data,unsigned length) {
-    auto profiles=parse_mouse_descriptor(data,length);std::lock_guard<std::mutex> lock(registry_mutex);
+    auto profiles=parse_mouse_descriptor(data,length);
+    WakeScheduler wake{false};
+    std::lock_guard<std::mutex> lock(registry_mutex);
     report_descriptors[number]=profiles;
-    if(!boot_protocol[number]){descriptors[number]=std::move(profiles);invalidate_interface(number);}
+    if(!boot_protocol[number]){descriptors[number]=std::move(profiles);invalidate_interface(number);wake.changed=true;}
 }
 void set_mouse_protocol(int number,bool boot) {
+    WakeScheduler wake;
     std::lock_guard<std::mutex> lock(registry_mutex);boot_protocol[number]=boot;
     if(boot) {
         MouseProfile profile;profile.size=3;profile.x={8,8,-127,127};profile.y={16,8,-127,127};
@@ -182,6 +337,7 @@ void set_mouse_protocol(int number,bool boot) {
     invalidate_interface(number);
 }
 void register_mouse_endpoint(thread_info* info,int number) {
+    WakeScheduler wake;
     std::lock_guard<std::mutex> lock(registry_mutex);Endpoint endpoint;
     endpoint.info=info;endpoint.interface_number=number;endpoint.generation=++next_generation;
     endpoint.instance=++next_endpoint_instance;
@@ -191,6 +347,7 @@ void register_mouse_endpoint(thread_info* info,int number) {
     endpoints[info->endpoint.bEndpointAddress]=std::move(endpoint);
 }
 void unregister_mouse_endpoint(thread_info* info) {
+    WakeScheduler wake;
     std::lock_guard<std::mutex> lock(registry_mutex);int address=info->endpoint.bEndpointAddress;
     auto found=endpoints.find(address);
     if(found!=endpoints.end()) {
@@ -203,6 +360,7 @@ void unregister_mouse_endpoint(thread_info* info) {
 }
 
 void queue_physical_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
+    WakeScheduler wake{false};
     std::lock_guard<std::mutex> lock(registry_mutex);auto found=endpoints.find(address);
     if(found==endpoints.end())return;
     auto& endpoint=found->second;auto* bytes=reinterpret_cast<uint8_t*>(io.data);
@@ -211,25 +369,36 @@ void queue_physical_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
     auto* profile=matching_profile(endpoint,bytes,io.inner.length);
     if(!profile)return;
     if(endpoint.latest.empty()) {
-        endpoint.profile=*profile;capture_report(address,endpoint.interface_number,bytes,io.inner.length);
+        wake.changed=true;endpoint.profile=*profile;capture_report(address,endpoint.interface_number,bytes,io.inner.length);
     }
     endpoint.latest.assign(bytes,bytes+io.inner.length);io.mouse_physical_match=1;
     io.physical_buttons=profile->button_mask(bytes);io.physical_x=profile->x.get(bytes);io.physical_y=profile->y.get(bytes);
     io.physical_wheel=profile->wheel.get(bytes);io.physical_pan=profile->pan.get(bytes);
-    if(io.physical_x||io.physical_y||io.physical_wheel||io.physical_pan||endpoint.physical_buttons!=io.physical_buttons)++endpoint.activity;
+    endpoint.physical_history.record(io.physical_queued_ns,io.physical_x,io.physical_y);
+    if(io.physical_x||io.physical_y||io.physical_wheel||io.physical_pan||endpoint.physical_buttons!=io.physical_buttons) {
+        ++endpoint.activity;wake.changed=true;
+    }
     endpoint.physical_buttons=io.physical_buttons;endpoint.physical_dx=io.physical_x;endpoint.physical_dy=io.physical_y;
     endpoint.cumulative_x=saturating_add(endpoint.cumulative_x,io.physical_x);
     endpoint.cumulative_y=saturating_add(endpoint.cumulative_y,io.physical_y);
-    if(io.physical_x||io.physical_y)endpoint.last_motion_ns=io.physical_queued_ns;
-    ++endpoint.physical_received;if(selected<0)selected=address;
+    if(io.physical_x||io.physical_y) {
+        endpoint.last_motion_ns=io.physical_queued_ns;
+        endpoint.hand_dx=io.physical_x;endpoint.hand_dy=io.physical_y;
+        if(endpoint.steering&&endpoint.steering->mode==mouse_history::SteeringMode::directional&&
+           std::abs(steering_bearing(*endpoint.steering,io.physical_x,io.physical_y))>
+               endpoint.steering->radius)
+            abort_steering(endpoint,io.physical_queued_ns);
+    }
+    ++endpoint.physical_received;if(selected<0){selected=address;wake.changed=true;}
 }
 
 void seed_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
+    WakeScheduler wake{false};
     std::lock_guard<std::mutex> lock(registry_mutex);auto found=endpoints.find(address);
     if(found==endpoints.end())return;
     auto& endpoint=found->second;auto* bytes=reinterpret_cast<uint8_t*>(io.data);
     auto* profile=matching_profile(endpoint,bytes,io.inner.length);if(!profile)return;
-    endpoint.profile=*profile;endpoint.latest.assign(bytes,bytes+io.inner.length);
+    wake.changed=true;endpoint.profile=*profile;endpoint.latest.assign(bytes,bytes+io.inner.length);
     for(const auto& field:endpoint.profile.relative)field.put(endpoint.latest.data(),0);
     endpoint.profile.put_buttons(endpoint.latest.data(),0);endpoint.submitted_template=endpoint.latest;
     std::memcpy(io.data,endpoint.latest.data(),endpoint.latest.size());endpoint.physical_buttons=0;
@@ -244,14 +413,7 @@ EndpointSnapshot endpoint_snapshot() {
     snapshot.persistent=endpoint.persistent_buttons;snapshot.scheduled=endpoint.scheduled_buttons;
     snapshot.xmin=endpoint.profile.x.minimum;snapshot.xmax=endpoint.profile.x.maximum;
     snapshot.activity=endpoint.activity;
-    // Stable layout fingerprint, independent of process/generation numbers.
-    uint64_t layout=1469598103934665603ull;
-    auto hash=[&](uint64_t n){for(int i=0;i<8;++i){layout^=uint8_t(n);layout*=1099511628211ull;n>>=8;}};
-    hash(endpoint.profile.id);hash(endpoint.profile.size);
-    auto field=[&](const HidField& f){hash(f.offset);hash(f.bits);hash(uint32_t(f.minimum));hash(uint32_t(f.maximum));};
-    field(endpoint.profile.x);field(endpoint.profile.y);field(endpoint.profile.wheel);field(endpoint.profile.pan);
-    for(const auto& b:endpoint.profile.buttons){hash(b.first);field(b.second);}
-    snapshot.layout=layout?layout:1;
+    snapshot.layout=endpoint.layout;snapshot.supported=endpoint.supported;
     snapshot.ymin=endpoint.profile.y.minimum;snapshot.ymax=endpoint.profile.y.maximum;
     snapshot.physical_dx=endpoint.physical_dx;snapshot.physical_dy=endpoint.physical_dy;
     snapshot.poll_us=std::max<uint32_t>(1,endpoint.info->mouse_poll_interval_us);snapshot.generation=endpoint.generation;
@@ -262,17 +424,86 @@ EndpointSnapshot endpoint_snapshot() {
     snapshot.cumulative_y=endpoint.cumulative_y;snapshot.last_motion_ns=endpoint.last_motion_ns;
     if(endpoint.last_motion_ns&&snapshot.snapshot_ns>=endpoint.last_motion_ns)
         snapshot.physical_age_us=saturate32((snapshot.snapshot_ns-endpoint.last_motion_ns)/1000);
-    for(const auto& button:endpoint.profile.buttons)snapshot.supported|=uint8_t(1u<<(button.first-1));
     if(endpoint.info&&endpoint.info->data_queue&&endpoint.info->data_mutex) {
         std::lock_guard<std::mutex> queue_lock(*endpoint.info->data_mutex);
         snapshot.output_queue=saturate16(endpoint.info->data_queue->size());
     }
-    if(!endpoint.residence_ns.empty()) {
-        std::vector<uint64_t> samples(endpoint.residence_ns.begin(),endpoint.residence_ns.end());
-        size_t index=(samples.size()*99+99)/100-1;std::nth_element(samples.begin(),samples.begin()+index,samples.end());
-        snapshot.p99_residence_ns=samples[index];
-    }
     return snapshot;
+}
+
+bool physical_mouse_history(mouse_history::Reply& reply) {
+    std::lock_guard<std::mutex> lock(registry_mutex);
+    const auto found=endpoints.find(selected);
+    if(found==endpoints.end()||found->second.latest.empty()||
+       found->second.info->mouse_poll_interval_us>1000)return false;
+    reply.generation=found->second.generation;
+    return found->second.physical_history.copy(monotonic_ns(),reply);
+}
+
+bool set_mouse_steering(const mouse_history::Steering& plan) {
+    std::lock_guard<std::mutex> lock(registry_mutex);
+    const auto found=endpoints.find(selected);
+    if(found==endpoints.end()||found->second.generation!=plan.generation)
+        return false;
+    auto& endpoint=found->second;
+    const auto now=monotonic_ns();
+    if(!plan.angle_cdeg) {
+        abort_steering(endpoint,now);
+        return true;
+    }
+    const auto now_ms=now/mouse_history::tick_ns;
+    if(endpoint.latest.empty()||!endpoint.synthetic.empty()||endpoint.info->mouse_poll_interval_us>1000||
+       plan.sample_ms>now_ms||plan.sample_ms<=endpoint.steering_abort_ms||plan.expires_ms<=now_ms)
+        return false;
+    using Mode=mouse_history::SteeringMode;
+    constexpr double radians_per_centidegree=3.14159265358979323846/18000;
+    const auto radius=plan.angle_cdeg*radians_per_centidegree;
+    ActiveSteering steering{now,plan.expires_ms,double(plan.aim[0]),double(plan.aim[1]),radius,0,plan.mode};
+    if(plan.mode==Mode::directional) {
+        if(!endpoint.last_motion_ns||now-endpoint.last_motion_ns>6*mouse_history::tick_ns||
+           (!endpoint.hand_dx&&!endpoint.hand_dy))
+            return false;
+        const bool engaged=endpoint.steering&&endpoint.steering->mode==Mode::directional&&
+                           endpoint.steering->expires_ms>now_ms;
+        // A narrower entry cone leaves a little room before the configured exit angle.
+        if(std::abs(steering_bearing(steering,endpoint.hand_dx,endpoint.hand_dy))>radius*(engaged?1:.9)) {
+            abort_steering(endpoint,now);
+            return false;
+        }
+        steering.tangent=std::clamp(steering_bearing(steering,plan.tangent[0],plan.tangent[1]),-radius,radius);
+    } else if(plan.mode==Mode::inner) {
+        const auto length=std::hypot(plan.tangent[0],plan.tangent[1]);
+        if(!length)
+            return false;
+        steering.unit_x=plan.tangent[0]/length;
+        steering.unit_y=plan.tangent[1]/length;
+    }
+    endpoint.steering=steering;
+    return true;
+}
+
+void clear_mouse_steering() {
+    std::lock_guard<std::mutex> lock(registry_mutex);
+    const auto found=endpoints.find(selected);
+    if(found!=endpoints.end()&&found->second.steering)
+        abort_steering(found->second,monotonic_ns());
+}
+
+uint64_t mouse_residence_p99_ns() {
+    std::array<uint64_t,MAX_RESIDENCE_SAMPLES> samples;
+    size_t count;
+    {
+        std::lock_guard<std::mutex> lock(registry_mutex);
+        const auto found=endpoints.find(selected);
+        if(found==endpoints.end()||found->second.latest.empty())return 0;
+        const auto& history=found->second.residence_ns;
+        count=history.size();
+        std::copy(history.begin(),history.end(),samples.begin());
+    }
+    if(!count)return 0;
+    const size_t index=(count*99+99)/100-1;
+    std::nth_element(samples.begin(),samples.begin()+index,samples.begin()+count);
+    return samples[index];
 }
 
 std::string mouse_state_text() {
@@ -300,8 +531,10 @@ EnqueueResult enqueue_report(MouseCommand command,uint8_t persistent,uint8_t sch
         endpoint.synthetic.pop_back();++endpoint.superseded;
     }
     if(endpoint.synthetic.size()>=MAX_SYNTHETIC_ITEMS)return EnqueueResult::QueueFull;
+    if(endpoint.steering)abort_steering(endpoint,monotonic_ns());
     SyntheticItem item;item.id=endpoint.next_item++;item.generation=endpoint.generation;
-    item.deadline_ns=latest?monotonic_ns()+25000000:0;item.physical_barrier=endpoint.physical_barrier;
+    item.deadline_ns=latest?monotonic_ns()+25000000:0;
+    item.physical_barrier=endpoint.physical_barrier;
     item.session=session;item.command_id=command_id;item.click_index=click_index;item.remaining=command;
     item.persistent=persistent;item.scheduled=scheduled;item.click_button=click_button;
     item.guard_activity=expected_activity;item.kind=kind;item.latest=latest;endpoint.synthetic.push_back(item);update_pending(endpoint);
@@ -313,6 +546,7 @@ EndpointSnapshot clear_synthetic_state() {
     result.generation=next_generation;result.snapshot_ns=monotonic_ns();auto found=endpoints.find(selected);
     if(found==endpoints.end())return result;
     auto& endpoint=found->second;endpoint.synthetic.clear();endpoint.inflight=false;endpoint.inflight_id=0;
+    abort_steering(endpoint,result.snapshot_ns);
     // The scheduler clears desired state immediately. These masks describe the last
     // successful USB write and become zero only when the final release completes.
     update_pending(endpoint);endpoint.info->data_cond->notify_all();result.ready=!endpoint.latest.empty();
@@ -362,7 +596,10 @@ bool take_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
             describe_synthetic(endpoint,item,io,applied,true,false,false);
         }
         if(compatible) {
-            int x=io.physical_x+applied.x,y=io.physical_y+applied.y;
+            int x=io.physical_x,y=io.physical_y;
+            if(!have_synthetic)
+                steer_physical(endpoint,io,now,x,y);
+            x+=applied.x;y+=applied.y;
             int wheel=io.physical_wheel+applied.wheel,pan=io.physical_pan+applied.pan;
             io.mouse_final_buttons=io.physical_buttons|persistent|scheduled;
             apply_known_fields(endpoint.profile,io,x,y,wheel,pan,io.mouse_final_buttons);
@@ -386,6 +623,7 @@ bool take_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
 
 void notify_mouse_report_written(uint8_t address,const usb_raw_transfer_io& io,bool success) {
     if(!io.mouse_managed)return;
+    WakeScheduler wake{false};
     uint64_t written=monotonic_ns();bool emit=false,finished=false;WriterEvent event;
     {
         std::lock_guard<std::mutex> lock(registry_mutex);auto found=endpoints.find(address);
@@ -423,7 +661,9 @@ void notify_mouse_report_written(uint8_t address,const usb_raw_transfer_io& io,b
                 item.remaining.wheel-=io.synthetic_wheel;item.remaining.pan-=io.synthetic_pan;
                 finished=no_motion(item.remaining)&&item.buttons_committed;
             }
+            const auto previous_depth=endpoint.synthetic.size();
             endpoint.inflight=false;endpoint.inflight_id=0;if(success)remove_finished_front(endpoint);else update_pending(endpoint);
+            wake.changed=endpoint.synthetic.size()<previous_depth;
         }
         if(current_layout&&(io.mouse_report_kind==REPORT_CLICK_PRESS||io.mouse_report_kind==REPORT_CLICK_RELEASE||
            io.mouse_report_kind==REPORT_RELEASE_ALL||io.mouse_report_kind>=REPORT_TRANSACTION_OUT||!success)) {
@@ -433,6 +673,7 @@ void notify_mouse_report_written(uint8_t address,const usb_raw_transfer_io& io,b
         }
     }
     if(emit) {
+        wake.changed=true;
         std::lock_guard<std::mutex> lock(event_mutex);
         if(writer_events.size()>=MAX_WRITER_EVENTS)writer_overflow=true;else writer_events.push_back(event);
     }

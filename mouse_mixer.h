@@ -1,6 +1,9 @@
 #pragma once
 #include "mouse_protocol.h"
+#include "mouse_history_protocol.h"
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -29,7 +32,7 @@ struct EndpointSnapshot {
     uint32_t poll_us=1000,physical_age_us=0xffffffffu;
     uint32_t physical_received=0,physical_submitted=0,superseded=0,writer_failures=0;
     uint16_t output_queue=0,synthetic_pending=0;
-    uint64_t generation=0,snapshot_ns=0,last_motion_ns=0,p99_residence_ns=0,activity=0,layout=0;
+    uint64_t generation=0,snapshot_ns=0,last_motion_ns=0,activity=0,layout=0;
     int64_t cumulative_x=0,cumulative_y=0;
 };
 
@@ -51,7 +54,14 @@ void seed_mouse_report(uint8_t endpoint,usb_raw_transfer_io& io);
 bool take_mouse_report(uint8_t endpoint,usb_raw_transfer_io& io);
 void notify_mouse_report_written(uint8_t endpoint,const usb_raw_transfer_io& io,bool success);
 
+// The UDP scheduler is the sole consumer of writer events. The token owns its wake callback.
+std::shared_ptr<const std::function<void()>> subscribe_mouse_scheduler(std::function<void()> wake);
+
 EndpointSnapshot endpoint_snapshot();
+bool physical_mouse_history(mouse_history::Reply& reply);
+bool set_mouse_steering(const mouse_history::Steering& plan);
+void clear_mouse_steering();
+uint64_t mouse_residence_p99_ns();
 std::string mouse_state_text();
 EnqueueResult enqueue_report(MouseCommand command,uint8_t persistent,uint8_t scheduled,
                              ReportKind kind,bool latest,uint64_t session=0,uint64_t command_id=0,

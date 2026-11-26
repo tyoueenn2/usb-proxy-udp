@@ -3,6 +3,8 @@
 #include <atomic>
 #include <thread>
 #include <cstdint>
+class SchedulerEvent;
+class SchedulerTimer;
 class UdpServer {
 public:
     explicit UdpServer(int port) : port(port) {}
@@ -14,5 +16,6 @@ private:
     int port, sockfd = -1;
     std::atomic<bool> running{false};
     std::thread server_thread;
-    void server_loop();
+    std::shared_ptr<SchedulerEvent> wake_;
+    void server_loop(SchedulerTimer& timer);
 };
