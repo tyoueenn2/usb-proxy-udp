@@ -471,6 +471,46 @@ void steering_rotates_the_physical_report() {
     assert((physical(100,0)==std::pair<int,int>{100,0}));
 }
 
+void inner_steering_redirects_reversed_reports() {
+    Fixture f;
+    auto physical=[&](int x,int y) {
+        f.push_physical(2,x,y,0xa0);
+        auto io=f.take();
+        assert(io.mouse_physical&&io.synthetic_item_id==0);
+        assert(io.physical_x==x&&io.physical_y==y&&Fixture::buttons(io)==2);
+        assert(Fixture::vendor(io)==0xa0);
+        f.complete(io);
+        return std::pair<int,int>{Fixture::x(io),Fixture::y(io)};
+    };
+    using Mode=mouse_history::SteeringMode;
+    mouse_history::Steering plan;
+    plan.session=1;plan.token=2;plan.epoch=3;plan.generation=endpoint_snapshot().generation;
+    plan.angle_cdeg=9000;plan.mode=Mode::inner;plan.aim={10000,0};plan.tangent={8000,6000};
+    auto install=[&] {
+        plan.sample_ms=fake_now/mouse_history::tick_ns;
+        plan.expires_ms=plan.sample_ms+20;
+        auto packet=mouse_history::packet(plan);
+        mouse_history::Steering decoded;
+        assert(mouse_history::parse_steering(packet.data(),packet.size(),decoded)&&decoded.mode==plan.mode);
+        assert(set_mouse_steering(decoded));
+        packet[6]=3;
+        assert(!mouse_history::parse_steering(packet.data(),packet.size(),decoded));
+    };
+    physical(0,0);
+    install(); // Inner steering can be ready before the user starts moving.
+    assert((physical(-100,0)==std::pair<int,int>{80,60}));
+    assert((physical(0,-100)==std::pair<int,int>{80,60}));
+    assert((physical(0,0)==std::pair<int,int>{0,0}));
+    assert(endpoint_snapshot().physical==2);
+    fake_now+=21000000;
+    assert((physical(-100,0)==std::pair<int,int>{-100,0}));
+    plan.mode=Mode::hold;plan.aim={};plan.tangent={};
+    install();
+    assert((physical(-100,50)==std::pair<int,int>{0,0}));
+    clear_mouse_steering();
+    assert((physical(-100,50)==std::pair<int,int>{-100,50}));
+}
+
 int main() {
     set_mouse_mixer_clock_for_test(fake_clock);
     transaction_writer_accounting();
@@ -483,6 +523,7 @@ int main() {
     cached_layout_and_residence();
     physical_report_history();
     steering_rotates_the_physical_report();
+    inner_steering_redirects_reversed_reports();
     cadence_fairness_and_residence(8000);cadence_fairness_and_residence(1000);cadence_fairness_and_residence(125);
     set_mouse_mixer_clock_for_test(nullptr);
     std::cout<<"Mixer ordering, fusion, masks, overflow, retries, bounds, fairness and fake cadences passed\n";

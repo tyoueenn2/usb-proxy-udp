@@ -11,6 +11,7 @@ constexpr size_t reply_size = 48 + samples * 4;
 constexpr uint64_t tick_ns = 1000000;
 constexpr size_t steering_size = 64;
 constexpr uint64_t steering_lifetime_ms = 20;
+constexpr uint16_t steering_max_angle_cdeg = 9000;
 using Trace = std::array<std::array<int, 2>, samples>;
 
 struct Reply {
@@ -18,10 +19,13 @@ struct Reply {
     Trace trace{};
 };
 
+enum class SteeringMode : uint8_t { directional, inner, hold };
+
 struct Steering {
     uint64_t session = 0, token = 0, epoch = 0, generation = 0;
     uint64_t sample_ms = 0, expires_ms = 0;
     uint16_t angle_cdeg = 0;
+    SteeringMode mode = SteeringMode::directional;
     std::array<int, 2> aim{}, tangent{};
 };
 
@@ -93,6 +97,7 @@ inline std::array<uint8_t, steering_size> packet(const Steering& steering) {
     std::memcpy(p.data(), "UPJ1", 4);
     p[4] = uint8_t(steering.angle_cdeg >> 8);
     p[5] = uint8_t(steering.angle_cdeg);
+    p[6] = uint8_t(steering.mode);
     size_t offset = 8;
     for (auto value : {steering.session, steering.token, steering.epoch, steering.generation,
                        steering.sample_ms, steering.expires_ms}) {
@@ -107,10 +112,11 @@ inline std::array<uint8_t, steering_size> packet(const Steering& steering) {
     return p;
 }
 inline bool parse_steering(const uint8_t* p, size_t n, Steering& result) {
-    if (n != steering_size || std::memcmp(p, "UPJ1", 4) || p[6] || p[7])
+    if (n != steering_size || std::memcmp(p, "UPJ1", 4) || p[6] > uint8_t(SteeringMode::hold) || p[7])
         return false;
     result = {};
     result.angle_cdeg = uint16_t(unsigned(p[4]) << 8 | p[5]);
+    result.mode = SteeringMode(p[6]);
     result.session = get64(p + 8);
     result.token = get64(p + 16);
     result.epoch = get64(p + 24);
@@ -129,12 +135,18 @@ inline bool parse_steering(const uint8_t* p, size_t n, Steering& result) {
             offset += 2;
         }
     }
+    const bool aim = result.aim != std::array<int, 2>{};
+    const bool tangent = result.tangent != std::array<int, 2>{};
     if (!result.angle_cdeg)
-        return !result.sample_ms && !result.expires_ms &&
-               result.aim == std::array<int, 2>{} && result.tangent == std::array<int, 2>{};
-    return result.angle_cdeg >= 50 && result.angle_cdeg <= 3000 &&
-           result.sample_ms && result.expires_ms > result.sample_ms &&
-           result.expires_ms - result.sample_ms <= steering_lifetime_ms &&
-           result.aim != std::array<int, 2>{} && result.tangent != std::array<int, 2>{};
+        return result.mode == SteeringMode::directional && !result.sample_ms && !result.expires_ms &&
+               !aim && !tangent;
+    if (result.angle_cdeg < 50 || result.angle_cdeg > steering_max_angle_cdeg || !result.sample_ms ||
+        result.expires_ms <= result.sample_ms || result.expires_ms - result.sample_ms > steering_lifetime_ms)
+        return false;
+    if (result.mode == SteeringMode::hold)
+        return !aim && !tangent;
+    if (result.mode == SteeringMode::inner)
+        return int64_t(result.aim[0]) * result.tangent[0] + int64_t(result.aim[1]) * result.tangent[1] > 0;
+    return aim && tangent;
 }
 } // namespace mouse_history

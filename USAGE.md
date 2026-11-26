@@ -448,15 +448,18 @@ generation, and rejects replayed sequence tokens. A steering update renews
 the controller lease only when the proxy can use it.
 
 The 64-byte network-order packet starts with `UPJ1`, a 16-bit angle in
-hundredths of a degree, and two reserved zero bytes. It then carries six
+hundredths of a degree, an 8-bit mode, and one reserved zero byte. It then carries six
 unsigned 64-bit values in order: session, sequence token, epoch, generation,
 history end time in monotonic milliseconds, and expiry time in the same clock.
 Four signed 16-bit values encode aim X/Y and desired tangent X/Y as direction
-components scaled by 10,000. The permitted angle is 0.50–30.00 degrees. To
-cancel, set the angle, both timestamps, and all direction components to zero.
+components scaled by 10,000. The permitted angle is 0.50–90.00 degrees. To
+cancel, set the mode, angle, both timestamps, and all direction components to zero.
 
-The expiry may be at most 20 ms after the history end time. The mixer checks
-the original physical direction before steering each report, cancels when
-the hand leaves the configured angle, and passes the out-of-cone report
-through. It preserves report count, output pacing, wheel, and physical buttons.
-Synthetic output takes priority over steering when present.
+The expiry may be at most 20 ms after the history end time. Receiver selects
+the mode from its current detection. Mode 0 checks the original physical
+direction before steering each report. The mixer cancels when the hand leaves
+the configured angle and passes the out-of-cone report through. Mode 1 redirects
+the magnitude of every physical movement along the targetward tangent even if
+the physical direction is reversed. Mode 2 holds XY at zero while centered and
+requires zero direction components. All modes preserve report count, output
+pacing, wheel, and physical buttons. Synthetic output takes priority.

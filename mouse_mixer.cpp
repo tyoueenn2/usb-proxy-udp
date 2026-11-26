@@ -100,7 +100,9 @@ struct PhysicalHistory {
 
 struct ActiveSteering {
     uint64_t received_ns, expires_ms;
-    double aim_x, aim_y, radius, tangent;
+    double aim_x, aim_y, radius, tangent=0;
+    mouse_history::SteeringMode mode;
+    double unit_x=0,unit_y=0;
 };
 struct Endpoint {
     thread_info* info=nullptr;
@@ -250,15 +252,28 @@ void steer_physical(Endpoint& endpoint,const usb_raw_transfer_io& io,uint64_t no
     if(io.physical_queued_ns<steering.received_ns||
        now-io.physical_queued_ns>=mouse_history::steering_lifetime_ms*mouse_history::tick_ns)
         return;
-    const auto bearing=steering_bearing(steering,x,y);
-    if(std::abs(bearing)>steering.radius) {
-        abort_steering(endpoint,now);
+    using Mode=mouse_history::SteeringMode;
+    if(steering.mode==Mode::hold) {
+        x=y=0;
         return;
     }
-    const auto delta=std::clamp(steering.tangent-bearing,-steering.radius,steering.radius);
-    const auto c=std::cos(delta),s=std::sin(delta);
     // Rotate the same vector. Only HID integer quantization changes its length.
-    const double dx=std::round(x*c-y*s),dy=std::round(x*s+y*c);
+    double dx,dy;
+    if(steering.mode==Mode::inner) {
+        const auto magnitude=std::hypot(x,y);
+        dx=std::round(steering.unit_x*magnitude);
+        dy=std::round(steering.unit_y*magnitude);
+    } else {
+        const auto bearing=steering_bearing(steering,x,y);
+        if(std::abs(bearing)>steering.radius) {
+            abort_steering(endpoint,now);
+            return;
+        }
+        const auto delta=std::clamp(steering.tangent-bearing,-steering.radius,steering.radius);
+        const auto c=std::cos(delta),s=std::sin(delta);
+        dx=std::round(x*c-y*s);
+        dy=std::round(x*s+y*c);
+    }
     if(dx>=endpoint.profile.x.minimum&&dx<=endpoint.profile.x.maximum&&
        dy>=endpoint.profile.y.minimum&&dy<=endpoint.profile.y.maximum) {
         x=int(dx);
@@ -369,7 +384,7 @@ void queue_physical_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
     if(io.physical_x||io.physical_y) {
         endpoint.last_motion_ns=io.physical_queued_ns;
         endpoint.hand_dx=io.physical_x;endpoint.hand_dy=io.physical_y;
-        if(endpoint.steering&&
+        if(endpoint.steering&&endpoint.steering->mode==mouse_history::SteeringMode::directional&&
            std::abs(steering_bearing(*endpoint.steering,io.physical_x,io.physical_y))>
                endpoint.steering->radius)
             abort_steering(endpoint,io.physical_queued_ns);
@@ -438,21 +453,31 @@ bool set_mouse_steering(const mouse_history::Steering& plan) {
     }
     const auto now_ms=now/mouse_history::tick_ns;
     if(endpoint.latest.empty()||!endpoint.synthetic.empty()||endpoint.info->mouse_poll_interval_us>1000||
-       plan.sample_ms>now_ms||plan.sample_ms<=endpoint.steering_abort_ms||plan.expires_ms<=now_ms||
-       !endpoint.last_motion_ns||now-endpoint.last_motion_ns>6*mouse_history::tick_ns||
-       (!endpoint.hand_dx&&!endpoint.hand_dy))
+       plan.sample_ms>now_ms||plan.sample_ms<=endpoint.steering_abort_ms||plan.expires_ms<=now_ms)
         return false;
+    using Mode=mouse_history::SteeringMode;
     constexpr double radians_per_centidegree=3.14159265358979323846/18000;
     const auto radius=plan.angle_cdeg*radians_per_centidegree;
-    ActiveSteering steering{now,plan.expires_ms,double(plan.aim[0]),double(plan.aim[1]),radius,0};
-    const bool engaged=endpoint.steering&&endpoint.steering->expires_ms>now_ms;
-    // A narrower entry cone leaves a little room before the configured exit angle.
-    if(std::abs(steering_bearing(steering,endpoint.hand_dx,endpoint.hand_dy))>
-           radius*(engaged?1:.9)) {
-        abort_steering(endpoint,now);
-        return false;
+    ActiveSteering steering{now,plan.expires_ms,double(plan.aim[0]),double(plan.aim[1]),radius,0,plan.mode};
+    if(plan.mode==Mode::directional) {
+        if(!endpoint.last_motion_ns||now-endpoint.last_motion_ns>6*mouse_history::tick_ns||
+           (!endpoint.hand_dx&&!endpoint.hand_dy))
+            return false;
+        const bool engaged=endpoint.steering&&endpoint.steering->mode==Mode::directional&&
+                           endpoint.steering->expires_ms>now_ms;
+        // A narrower entry cone leaves a little room before the configured exit angle.
+        if(std::abs(steering_bearing(steering,endpoint.hand_dx,endpoint.hand_dy))>radius*(engaged?1:.9)) {
+            abort_steering(endpoint,now);
+            return false;
+        }
+        steering.tangent=std::clamp(steering_bearing(steering,plan.tangent[0],plan.tangent[1]),-radius,radius);
+    } else if(plan.mode==Mode::inner) {
+        const auto length=std::hypot(plan.tangent[0],plan.tangent[1]);
+        if(!length)
+            return false;
+        steering.unit_x=plan.tangent[0]/length;
+        steering.unit_y=plan.tangent[1]/length;
     }
-    steering.tangent=std::clamp(steering_bearing(steering,plan.tangent[0],plan.tangent[1]),-radius,radius);
     endpoint.steering=steering;
     return true;
 }
