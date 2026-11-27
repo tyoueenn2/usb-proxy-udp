@@ -523,7 +523,7 @@ EnqueueResult enqueue_report(MouseCommand command,uint8_t persistent,uint8_t sch
     if((expected_generation&&endpoint.generation!=expected_generation)||
        (expected_activity!=UINT64_MAX&&endpoint.activity!=expected_activity))return EnqueueResult::NotReady;
     command.buttons=persistent|scheduled;
-    if(split_mouse_command(endpoint.profile,command).empty())return EnqueueResult::Unsupported;
+    if(!first_mouse_report(endpoint.profile,command))return EnqueueResult::Unsupported;
     if(latest)while(!endpoint.synthetic.empty()) {
         const auto& tail=endpoint.synthetic.back();
         if((endpoint.inflight&&tail.id==endpoint.inflight_id)||!tail.latest||tail.kind!=REPORT_MOVEMENT||
@@ -573,8 +573,7 @@ bool take_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
         bool compatible=candidate.mouse_physical_match&&candidate.mouse_generation==endpoint.generation;
         fusion_motion=item.remaining;
         if(item.kind>=REPORT_TRANSACTION_OUT){
-            auto parts=split_mouse_command(endpoint.profile,item.remaining);
-            if(!parts.empty())fusion_motion=parts.front();
+            if(auto part=first_mouse_report(endpoint.profile,item.remaining))fusion_motion=*part;
         }
         fuse=compatible&&motion_fits(endpoint.profile,candidate,fusion_motion);
         buttons_only=compatible&&!item.buttons_committed&&
@@ -614,8 +613,8 @@ bool take_mouse_report(uint8_t address,usb_raw_transfer_io& io) {
     std::memcpy(io.data,base.data(),base.size());
     for(const auto& field:endpoint.profile.relative)field.put(reinterpret_cast<uint8_t*>(io.data),0);
     MouseCommand command=item.remaining;command.buttons=item.persistent|item.scheduled;
-    auto parts=split_mouse_command(endpoint.profile,command);if(parts.empty())return false;
-    MouseCommand applied=parts.front();endpoint.profile.encode(applied,reinterpret_cast<uint8_t*>(io.data));
+    auto part=first_mouse_report(endpoint.profile,command);if(!part)return false;
+    MouseCommand applied=*part;endpoint.profile.encode(applied,reinterpret_cast<uint8_t*>(io.data));
     io.mouse_final_buttons=endpoint.submitted_physical_buttons|item.persistent|item.scheduled;
     endpoint.profile.put_buttons(reinterpret_cast<uint8_t*>(io.data),io.mouse_final_buttons);
     describe_synthetic(endpoint,item,io,applied,true,true,competing);return true;

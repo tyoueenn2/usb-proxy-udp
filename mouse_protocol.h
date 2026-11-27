@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <vector>
 #include <algorithm>
 struct MouseCommand { int x=0,y=0,wheel=0,pan=0; uint8_t buttons=0; };
@@ -116,26 +117,31 @@ inline std::vector<MouseProfile> parse_mouse_descriptor(const uint8_t* p,size_t 
     for(auto& p:profiles) if(!shared_report[p.first]&&p.second.x.bits&&p.second.y.bits&&!p.second.buttons.empty())result.push_back(p.second);
     return result;
 }
-// Split relative deltas to the actual report limits; never silently wrap or clamp.
-inline std::vector<MouseCommand> split_mouse_command(const MouseProfile& p, MouseCommand c) {
-    uint8_t supported=0;
-    for (const auto& b:p.buttons) supported|=uint8_t(1u<<(b.first-1));
-    if (c.buttons & ~supported) return {};
-    std::vector<MouseCommand> result;
-    do {
-        MouseCommand part; part.buttons=c.buttons;
-        auto take=[](const HidField& f,int& remaining,int& value) {
-            if (!f.bits) return remaining==0;
-            value=std::max(f.minimum,std::min(f.maximum,remaining));
-            if (remaining && !value) return false;
-            remaining-=value; return true;
-        };
-        if (!take(p.x,c.x,part.x)||!take(p.y,c.y,part.y)||
-            !take(p.wheel,c.wheel,part.wheel)||!take(p.pan,c.pan,part.pan)) return {};
-        result.push_back(part);
-        if (result.size()==32 && (c.x||c.y||c.wheel||c.pan)) return {};
-    } while(c.x||c.y||c.wheel||c.pan);
-    return result;
+// Validate the complete command against the report budget and return the
+// first report. Each axis advances independently, so the slowest axis
+// determines how many reports are needed.
+inline std::optional<MouseCommand> first_mouse_report(const MouseProfile& profile, const MouseCommand& command) {
+    uint8_t supported = 0;
+    for (const auto& button : profile.buttons)
+        supported |= uint8_t(1u << (button.first - 1));
+    if (command.buttons & ~supported)
+        return std::nullopt;
+
+    constexpr int max_reports = 32;
+    auto take = [&](const HidField& field, int delta, int& value) {
+        if (!field.bits)
+            return delta == 0;
+        if (delta < int64_t(field.minimum) * max_reports || delta > int64_t(field.maximum) * max_reports)
+            return false;
+        value = std::clamp(delta, field.minimum, field.maximum);
+        return true;
+    };
+    MouseCommand report;
+    report.buttons = command.buttons;
+    if (!take(profile.x, command.x, report.x) || !take(profile.y, command.y, report.y) ||
+        !take(profile.wheel, command.wheel, report.wheel) || !take(profile.pan, command.pan, report.pan))
+        return std::nullopt;
+    return report;
 }
 inline uint32_t read_be32(const uint8_t* p){return uint32_t(p[0])<<24|uint32_t(p[1])<<16|uint32_t(p[2])<<8|p[3];}
 inline int read_i16(const uint8_t* p){unsigned n=unsigned(p[0])*256+p[1];return n<32768?int(n):int(n)-65536;}

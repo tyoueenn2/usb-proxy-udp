@@ -34,12 +34,22 @@ int main() {
         assert(p.x.get(report.data())==-100 && p.y.get(report.data())==100);
         assert(p.wheel.get(report.data())==-1 && p.button_mask(report.data())==0x15);
         c={};assert(p.encode(c,report.data()));assert(p.wheel.get(report.data())==0);
-        c.x=320;c.y=-320;auto parts=split_mouse_command(p,c);
-        assert(parts.size()==(bits==8?3u:1u));int x=0,y=0;
-        for(auto& part:parts){assert(p.encode(part,report.data()));x+=p.x.get(report.data());y+=p.y.get(report.data());}
-        assert(x==320&&y==-320);
-        c.pan=1;assert(split_mouse_command(p,c).empty());
-        c={};c.buttons=128;assert(split_mouse_command(p,c).empty());
+        c.x=320;c.y=-320;
+        int x=0,y=0;unsigned parts=0;
+        do {
+            auto part=first_mouse_report(p,c);
+            assert(part&&p.encode(*part,report.data()));
+            x+=p.x.get(report.data());y+=p.y.get(report.data());
+            c.x-=part->x;c.y-=part->y;++parts;
+        } while(c.x||c.y);
+        assert(x==320&&y==-320&&parts==(bits==8?3u:1u));
+        c.x=p.x.maximum*32;c.y=p.y.minimum*32;
+        auto first=first_mouse_report(p,c);
+        assert(first&&first->x==p.x.maximum&&first->y==p.y.minimum);
+        ++c.x;assert(!first_mouse_report(p,c));
+        --c.x;--c.y;assert(!first_mouse_report(p,c));
+        c={};c.pan=1;assert(!first_mouse_report(p,c));
+        c={};c.buttons=128;assert(!first_mouse_report(p,c));
         for(size_t n=0;n<d.size();++n)assert(parse_mouse_descriptor(d.data(),n).empty());
         if(id){report[0]=3;assert(!p.matches(report.data(),report.size()));}
     }
